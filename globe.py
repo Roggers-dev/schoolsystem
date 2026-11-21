@@ -144,6 +144,42 @@ def format_full_name(surname: str, first_name: str, middle_name: str = "") -> st
     return " ".join(parts)
 
 
+def save_teacher_class_assignments(conn, staff_id: str, class_levels: list):
+    """Replace a teacher's class allocations atomically; an empty list means all classes."""
+    valid_levels = list(dict.fromkeys(level for level in (class_levels or []) if level in CLASS_LEVELS))
+    if not valid_levels:
+        valid_levels = list(CLASS_LEVELS)
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM teacher_class_assignments WHERE staff_id = ?", (staff_id,))
+    cursor.executemany(
+        "INSERT INTO teacher_class_assignments (staff_id, class_level, assigned_at) VALUES (?, ?, ?)",
+        [(staff_id, level, now_text) for level in valid_levels],
+    )
+    legacy_value = "All / Multiple Classes" if len(valid_levels) == len(CLASS_LEVELS) else ", ".join(valid_levels)
+    cursor.execute("UPDATE teachers SET assigned_class_level = ? WHERE staff_id = ?", (legacy_value, staff_id))
+
+
+def get_teacher_assigned_classes(conn, username: str):
+    """Return assigned classes for a portal account; legacy accounts default safely to all."""
+    row = conn.execute("SELECT staff_id FROM teachers WHERE username = ?", (username,)).fetchone()
+    if not row:
+        return list(CLASS_LEVELS)
+    rows = conn.execute(
+        "SELECT class_level FROM teacher_class_assignments WHERE staff_id = ? ORDER BY assignment_id",
+        (row["staff_id"],),
+    ).fetchall()
+    if rows:
+        return [r["class_level"] for r in rows if r["class_level"] in CLASS_LEVELS]
+    # Compatibility fallback for a teacher profile created before the new table.
+    legacy = conn.execute("SELECT assigned_class_level FROM teachers WHERE staff_id = ?", (row["staff_id"],)).fetchone()
+    legacy_value = (legacy["assigned_class_level"] or "").strip() if legacy else ""
+    if not legacy_value or legacy_value == "All / Multiple Classes":
+        return list(CLASS_LEVELS)
+    parsed = [part.strip() for part in legacy_value.split(",") if part.strip() in CLASS_LEVELS]
+    return parsed or list(CLASS_LEVELS)
+
+
 def generate_admission_number(surname: str, first_name: str, middle_name: str = "", seq_num: int = 1) -> str:
     """Attaches letters from the student's name plus year and sequence number."""
     s_letters = re.sub(r"[^A-Za-z]", "", surname or "X")[:2].upper().ljust(2, "X")
@@ -441,8 +477,39 @@ def init_db():
     _ensure_column(c, "students", "assigned_teacher_name", "TEXT")
     _ensure_column(c, "teachers", "assigned_class_level", "TEXT")
 
+    # Normalized many-to-many teacher/class assignments. The legacy column is
+    # retained for compatibility with existing versions and reports.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS teacher_class_assignments (
+            assignment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            staff_id TEXT NOT NULL,
+            class_level TEXT NOT NULL,
+            assigned_at TEXT NOT NULL,
+            UNIQUE(staff_id, class_level),
+            FOREIGN KEY(staff_id) REFERENCES teachers(staff_id) ON DELETE CASCADE
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_teacher_class_staff ON teacher_class_assignments(staff_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_teacher_class_level ON teacher_class_assignments(class_level)")
+
     c.execute("UPDATE students SET promotion_status = 'Promoted' WHERE promotion_status IS NULL OR TRIM(promotion_status) = ''")
     c.execute("UPDATE students SET student_edit_locked = 1 WHERE student_edit_locked IS NULL")
+
+    # One-time/idempotent migration: preserve existing teacher class allocations.
+    legacy_teachers = c.execute(
+        "SELECT staff_id, assigned_class_level FROM teachers WHERE assigned_class_level IS NOT NULL AND TRIM(assigned_class_level) != ''"
+    ).fetchall()
+    for legacy_teacher in legacy_teachers:
+        legacy_class = str(legacy_teacher["assigned_class_level"]).strip()
+        if legacy_class == "All / Multiple Classes":
+            legacy_classes = CLASS_LEVELS
+        else:
+            legacy_classes = [part.strip() for part in legacy_class.split(",") if part.strip() in CLASS_LEVELS]
+        for legacy_level in legacy_classes:
+            c.execute(
+                "INSERT OR IGNORE INTO teacher_class_assignments (staff_id, class_level, assigned_at) VALUES (?, ?, ?)",
+                (legacy_teacher["staff_id"], legacy_level, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
 
     # Idempotent indexes to guard against duplicate records & speed lookups
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_assessment ON assessments(student_id, term, subject)")
@@ -508,8 +575,18 @@ def determine_term_honour(avg_score: float, min_pass_mark: float = 60.0):
 def generate_clash_free_timetable(conn, target_class: str, days: list, time_slots: list, chosen_subjects: list, mode_used: str, created_by: str):
     c = conn.cursor()
 
-    c.execute("SELECT full_name, assigned_subject FROM teachers WHERE status = 'Active'")
+    c.execute("SELECT staff_id, full_name, assigned_subject, assigned_class_level FROM teachers WHERE status = 'Active'")
     active_teachers = [dict(r) for r in c.fetchall()]
+    for teacher in active_teachers:
+        c.execute(
+            "SELECT class_level FROM teacher_class_assignments WHERE staff_id = ?",
+            (teacher["staff_id"],),
+        )
+        allocated = {row["class_level"] for row in c.fetchall()}
+        if not allocated:
+            legacy_value = (teacher.get("assigned_class_level") or "").strip()
+            allocated = set(CLASS_LEVELS) if legacy_value.lower() in ("all", "all classes", "multiple classes") else {x.strip() for x in legacy_value.split(",") if x.strip()}
+        teacher["allocated_classes"] = allocated or set(CLASS_LEVELS)
 
     c.execute("SELECT day_of_week, time_slot, teacher_name FROM school_timetable WHERE class_level != ?", (target_class,))
     booked_slots = {(r["day_of_week"], r["time_slot"], r["teacher_name"]) for r in c.fetchall()}
@@ -532,8 +609,9 @@ def generate_clash_free_timetable(conn, target_class: str, days: list, time_slot
                 if candidate_sub in used_subjects_today and len(subject_pool) > len(time_slots):
                     continue
 
-                matching_teachers = [t["full_name"] for t in active_teachers if t["assigned_subject"] == candidate_sub]
-                other_teachers = [t["full_name"] for t in active_teachers if t["full_name"] not in matching_teachers]
+                eligible_teachers = [t for t in active_teachers if target_class in t["allocated_classes"]]
+                matching_teachers = [t["full_name"] for t in eligible_teachers if t["assigned_subject"] == candidate_sub]
+                other_teachers = [t["full_name"] for t in eligible_teachers if t["full_name"] not in matching_teachers]
                 ordered_candidates = matching_teachers + other_teachers
 
                 for t_name in ordered_candidates:
@@ -549,15 +627,10 @@ def generate_clash_free_timetable(conn, target_class: str, days: list, time_slot
                     break
 
             if not assigned_teacher_name:
-                assigned_sub = subject_pool[sub_idx % len(subject_pool)]
-                sub_idx += 1
-                fallback_teacher = f"{assigned_sub} Master"
-                if (day, slot, fallback_teacher) not in booked_slots:
-                    assigned_teacher_name = fallback_teacher
-                    booked_slots.add((day, slot, fallback_teacher))
-                else:
-                    conflicts_skipped += 1
-                    continue
+                # Do not invent a placeholder teacher or assign a teacher outside
+                # their registered class allocation. Leave this slot unscheduled.
+                conflicts_skipped += 1
+                continue
 
             c.execute(
                 """
@@ -1580,9 +1653,22 @@ elif menu == "📝 Student Registration & Edit":
                 chosen_t_label = st.selectbox("Select Teacher to View Registered Students & Counts", list(t_sel_map.keys()), key="admin_view_tch_students")
                 t_info_obj = t_sel_map[chosen_t_label]
 
-                # Match students explicitly assigned to this teacher OR in the teacher's assigned class/subject timetable
+                # Match direct learner assignments, timetable assignments, or any allocated class.
+                t_class_rows = c.execute(
+                    "SELECT class_level FROM teacher_class_assignments WHERE staff_id = ?",
+                    (t_info_obj["staff_id"],),
+                ).fetchall()
+                t_assigned_classes = [row["class_level"] for row in t_class_rows]
+                if not t_assigned_classes:
+                    legacy_class = (t_info_obj["assigned_class_level"] or "").strip()
+                    t_assigned_classes = CLASS_LEVELS if legacy_class in ("", "All / Multiple Classes") else [
+                        part.strip() for part in legacy_class.split(",") if part.strip() in CLASS_LEVELS
+                    ]
+                if not t_assigned_classes:
+                    t_assigned_classes = CLASS_LEVELS
+                placeholders = ",".join("?" for _ in t_assigned_classes)
                 t_stu_df = pd.read_sql_query(
-                    """
+                    f"""
                     SELECT DISTINCT s.student_id AS 'Adm. No.', s.full_name AS 'Learner Name',
                            s.gender AS 'Gender', s.class_level AS 'Class',
                            s.program AS 'Programme', s.promotion_status AS 'Status',
@@ -1596,7 +1682,7 @@ elif menu == "📝 Student Registration & Edit":
                             s.assigned_teacher_staff_id = ?
                          OR s.assigned_teacher_name = ?
                          OR tt.teacher_name = ?
-                         OR (? IS NOT NULL AND ? != 'All / Multiple Classes' AND s.class_level = ?)
+                         OR s.class_level IN ({placeholders})
                       )
                     ORDER BY s.class_level, s.full_name
                     """,
@@ -1607,9 +1693,7 @@ elif menu == "📝 Student Registration & Edit":
                         t_info_obj["staff_id"],
                         t_info_obj["full_name"],
                         t_info_obj["full_name"],
-                        t_info_obj["assigned_class_level"],
-                        t_info_obj["assigned_class_level"],
-                        t_info_obj["assigned_class_level"],
+                        *t_assigned_classes,
                     ),
                 )
 
@@ -1764,7 +1848,20 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
             t_user = st.text_input("Portal Username", placeholder="e.g., eosei")
             t_pass = st.text_input("Portal Password", type="password", placeholder="Set password")
 
-        assigned_cls_lvl = st.selectbox("Primary Class / Grade Level Assigned (Optional)", ["All / Multiple Classes"] + CLASS_LEVELS)
+        st.markdown("**Class Allocation**")
+        assign_all_classes = st.checkbox("Teacher handles ALL classes", value=False, key="teacher_register_all_classes")
+        assigned_cls_levels = st.multiselect(
+            "Select every class this teacher handles",
+            CLASS_LEVELS,
+            default=[],
+            help="Select one class, several classes, or tick the option above for all classes.",
+            disabled=assign_all_classes,
+            key="teacher_register_class_levels",
+        )
+        if assign_all_classes:
+            st.caption(f"All {len(CLASS_LEVELS)} class levels will be assigned.")
+        else:
+            st.caption(f"{len(assigned_cls_levels)} class level(s) selected.")
         confirm_t = st.checkbox("I confirm all teacher registration entries are accurate.")
         if st.form_submit_button("Register Teacher"):
             if not t_surname.strip():
@@ -1780,6 +1877,8 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
                 st.error("Please tick the confirmation box before submitting.")
             elif create_login and (not t_user.strip() or not t_pass.strip()):
                 st.error("Please provide Username and Password for the teacher portal login.")
+            elif not assign_all_classes and not assigned_cls_levels:
+                st.error("Select at least one class, or tick 'Teacher handles ALL classes'.")
             else:
                 full_t_name = format_full_name(t_surname, t_first, t_middle)
                 t_photo_bytes = t_photo.getvalue() if t_photo is not None else None
@@ -1806,12 +1905,17 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
                             acad_prog,
                             department,
                             assigned_sub,
-                            assigned_cls_lvl,
+                            "All / Multiple Classes" if assign_all_classes else ", ".join(assigned_cls_levels),
                             t_photo_bytes,
                             t_photo_mime,
                             datetime.now().strftime("%Y-%m-%d"),
                             t_user.strip() if create_login else None,
                         ),
+                    )
+                    save_teacher_class_assignments(
+                        conn,
+                        staff_id.strip().upper(),
+                        CLASS_LEVELS if assign_all_classes else assigned_cls_levels,
                     )
                     if create_login:
                         c.execute(
@@ -1821,7 +1925,67 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
                     conn.commit()
                     st.success(f"Teacher **{full_t_name}** (`{staff_id.upper()}`) registered under **{acad_prog}**!")
                 except sqlite3.IntegrityError:
-                    st.error("Staff ID or Username already exists.")
+                    conn.rollback()
+                    st.error("Staff ID or Username already exists. No partial teacher record was saved.")
+                except Exception as registration_error:
+                    conn.rollback()
+                    st.error(f"Teacher registration failed; no partial record was saved: {registration_error}")
+
+    st.divider()
+    st.subheader("Manage Existing Teacher Class Allocations")
+    allocation_rows = c.execute(
+        "SELECT staff_id, full_name, assigned_class_level FROM teachers WHERE status = 'Active' ORDER BY full_name"
+    ).fetchall()
+    if allocation_rows:
+        allocation_map = {
+            f"{row['full_name']} ({row['staff_id']})": row["staff_id"] for row in allocation_rows
+        }
+        chosen_allocation_label = st.selectbox(
+            "Select teacher to update class allocation", list(allocation_map.keys()), key="teacher_allocation_staff"
+        )
+        chosen_staff_id = allocation_map[chosen_allocation_label]
+        current_allocations = [
+            row["class_level"]
+            for row in c.execute(
+                "SELECT class_level FROM teacher_class_assignments WHERE staff_id = ? ORDER BY assignment_id",
+                (chosen_staff_id,),
+            ).fetchall()
+        ]
+        if not current_allocations:
+            legacy_row = c.execute(
+                "SELECT assigned_class_level FROM teachers WHERE staff_id = ?", (chosen_staff_id,)
+            ).fetchone()
+            legacy_value = (legacy_row["assigned_class_level"] or "").strip() if legacy_row else ""
+            current_allocations = CLASS_LEVELS if legacy_value in ("", "All / Multiple Classes") else [
+                part.strip() for part in legacy_value.split(",") if part.strip() in CLASS_LEVELS
+            ]
+        if not current_allocations:
+            current_allocations = list(CLASS_LEVELS)
+        allocation_all = st.checkbox(
+            "This teacher handles ALL classes", value=(len(current_allocations) == len(CLASS_LEVELS)),
+            key=f"allocation_all_{chosen_staff_id}"
+        )
+        revised_allocations = st.multiselect(
+            "Assigned class levels", CLASS_LEVELS,
+            default=current_allocations,
+            disabled=allocation_all,
+            key=f"allocation_levels_{chosen_staff_id}"
+        )
+        if st.button("Save Teacher Class Allocation", key="save_teacher_allocation"):
+            if not allocation_all and not revised_allocations:
+                st.error("Select at least one class or choose all classes.")
+            else:
+                try:
+                    create_db_backup("teacher_class_allocation")
+                    save_teacher_class_assignments(
+                        conn, chosen_staff_id, CLASS_LEVELS if allocation_all else revised_allocations
+                    )
+                    conn.commit()
+                    st.success("Teacher class allocation updated successfully.")
+                    st.rerun()
+                except Exception as allocation_error:
+                    conn.rollback()
+                    st.error(f"Could not update teacher class allocation: {allocation_error}")
 
     st.divider()
     st.subheader("Registered Teachers")
@@ -1837,7 +2001,13 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
                 else:
                     st.caption("No Photo")
             with cols[1]:
-                st.markdown(f"**{tr['full_name']}** (`{tr['staff_id']}`) — **{tr['gender']}** | **{tr['academic_programme']}** | Subject: **{tr['assigned_subject']}** | Dept: {tr['department']} | Tel: {tr['phone']}")
+                class_rows = c.execute(
+                    "SELECT class_level FROM teacher_class_assignments WHERE staff_id = ? ORDER BY assignment_id",
+                    (tr["staff_id"],),
+                ).fetchall()
+                class_names = [row["class_level"] for row in class_rows]
+                class_text = "All Classes" if len(class_names) == len(CLASS_LEVELS) else (", ".join(class_names) if class_names else "Not assigned")
+                st.markdown(f"**{tr['full_name']}** (`{tr['staff_id']}`) — **{tr['gender']}** | **{tr['academic_programme']}** | Subject: **{tr['assigned_subject']}** | Classes: **{class_text}** | Dept: {tr['department']} | Tel: {tr['phone']}")
     conn.close()
 
 
@@ -1849,9 +2019,10 @@ elif menu == "👔 School Manager Profile & Timetable/Register":
     conn = get_connection()
     c = conn.cursor()
 
-    tab_mgr, tab_tt, tab_reg = st.tabs([
+    tab_mgr, tab_tt, tab_workload, tab_reg = st.tabs([
         "🪪 School Manager Profile & Passport",
         "🗓️ Clash-Free Timetable Generator",
+        "📊 Teacher Workload & Timetable",
         "📋 School Register Generator",
     ])
 
@@ -1930,6 +2101,43 @@ elif menu == "👔 School Manager Profile & Timetable/Register":
         if not tt_df.empty:
             st.dataframe(tt_df, use_container_width=True)
 
+    with tab_workload:
+        st.subheader("Teacher Workload Overview")
+        st.caption("Review each teacher's weekly teaching periods and inspect their assigned timetable. Counts are based on the timetable currently saved in the system.")
+        workload_df = pd.read_sql_query(
+            """
+            SELECT teacher_name AS 'Teacher', COUNT(*) AS 'Weekly Periods',
+                   COUNT(DISTINCT class_level) AS 'Classes',
+                   COUNT(DISTINCT subject) AS 'Subjects'
+            FROM school_timetable
+            GROUP BY teacher_name
+            ORDER BY COUNT(*) DESC, teacher_name ASC
+            """,
+            conn,
+        )
+        if workload_df.empty:
+            st.info("No timetable entries are available yet. Generate a class timetable to see teacher workloads here.")
+        else:
+            st.dataframe(workload_df, use_container_width=True, hide_index=True)
+            teacher_options = sorted(workload_df["Teacher"].dropna().astype(str).unique().tolist())
+            chosen_teacher = st.selectbox("View individual teacher timetable", teacher_options, key="workload_teacher_view")
+            teacher_tt_df = pd.read_sql_query(
+                """
+                SELECT class_level AS 'Class', day_of_week AS 'Day', time_slot AS 'Time',
+                       subject AS 'Subject', mode_used AS 'Generation Mode'
+                FROM school_timetable
+                WHERE teacher_name = ?
+                ORDER BY CASE day_of_week
+                    WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3
+                    WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 ELSE 6 END, time_slot
+                """,
+                conn,
+                params=(chosen_teacher,),
+            )
+            st.dataframe(teacher_tt_df, use_container_width=True, hide_index=True)
+            weekly_periods = len(teacher_tt_df)
+            st.metric("Scheduled periods this week", weekly_periods)
+
     with tab_reg:
         st.subheader("Automatic School Register Generator")
         st.write("Choose a class and date to automatically generate/update the daily school register for active learners.")
@@ -1985,11 +2193,17 @@ elif menu == "📖 Daily/Weekly Lessons & Remaining Topics":
     st.header("Daily & Weekly Areas Taught + Lessons Left to Cover")
     conn = get_connection()
     c = conn.cursor()
+    lesson_class_options = (
+        get_teacher_assigned_classes(conn, user["username"])
+        if user["role"] == "Teacher" else list(CLASS_LEVELS)
+    )
+    if not lesson_class_options:
+        lesson_class_options = list(CLASS_LEVELS)
 
     with st.form("lesson_log_form", clear_on_submit=False):
         l1, l2, l3 = st.columns(3)
         with l1:
-            l_class = st.selectbox("Class / Grade Level", CLASS_LEVELS)
+            l_class = st.selectbox("Class / Grade Level", lesson_class_options)
         with l2:
             l_subject = st.selectbox("Subject", SUBJECTS_LIST)
         with l3:
@@ -2068,6 +2282,13 @@ elif menu == "🧮 Continuous Assessment & Score Entry":
             subject = st.selectbox("Subject", SUBJECTS_LIST, key="ass_sub_sel")
         with top3:
             class_choices = sorted(students["class_level"].dropna().unique().tolist())
+            if user["role"] == "Teacher":
+                permitted_classes = set(get_teacher_assigned_classes(conn, user["username"]))
+                class_choices = [level for level in class_choices if level in permitted_classes]
+            if not class_choices:
+                st.warning("No active learners are registered in the class levels assigned to this account.")
+                conn.close()
+                st.stop()
             selected_cls = st.selectbox("Select Class / Grade Level", class_choices, key="ass_cls_sel")
 
         cls_students = students[students["class_level"] == selected_cls].reset_index(drop=True)
@@ -2314,6 +2535,9 @@ elif menu == "🎓 Student Certificates & Term Honours":
     conn = get_connection()
     c = conn.cursor()
     students_rows = c.execute("SELECT * FROM students ORDER BY full_name ASC").fetchall()
+    if user["role"] == "Teacher":
+        permitted_classes = set(get_teacher_assigned_classes(conn, user["username"]))
+        students_rows = [row for row in students_rows if row["class_level"] in permitted_classes]
 
     tab_comp, tab_term = st.tabs([
         "🏅 Certificate of Completion (Individual Learner)",
@@ -3012,6 +3236,9 @@ elif menu == "📄 Terminal Report Cards (PDF Export)":
     st.header("Automated Terminal Report Card & PDF Generator")
     conn = get_connection()
     students = pd.read_sql_query("SELECT * FROM students WHERE status='Active' ORDER BY full_name ASC", conn)
+    if user["role"] == "Teacher":
+        permitted_classes = set(get_teacher_assigned_classes(conn, user["username"]))
+        students = students[students["class_level"].isin(permitted_classes)].copy()
     if students.empty:
         st.warning("No active learners found.")
     else:
@@ -3192,6 +3419,6 @@ elif menu == "👥 Manage Staff & Roles":
                 c.execute("UPDATE users SET role=? WHERE username=?", (new_r, u_map[sel_u]))
                 conn.commit()
                 st.success(f"Updated role for `{u_map[sel_u]}` to **{new_r}**!")
-    df_u = pd.read_sql_query("SELECT username, full_name, role, assigned_subject FROM users", conn)
+    df_u = pd.read_sql_query("SELECT username, full_name, srrole, assigned_subject FROM users", conn)
     st.dataframe(df_u, use_container_width=True)
     conn.close()
