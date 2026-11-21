@@ -129,8 +129,18 @@ def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
 
+def capitalize_initials(name: str) -> str:
+    """Capitalizes the initial letter of every word/segment in a name without clearing user input."""
+    if not name:
+        return ""
+    return " ".join(
+        "-".join(part[:1].upper() + part[1:] if part else "" for part in word.split("-"))
+        for word in name.strip().split()
+    )
+
+
 def format_full_name(surname: str, first_name: str, middle_name: str = "") -> str:
-    parts = [p.strip() for p in [surname, first_name, middle_name] if p and p.strip()]
+    parts = [capitalize_initials(p) for p in [surname, first_name, middle_name] if p and p.strip()]
     return " ".join(parts)
 
 
@@ -925,6 +935,80 @@ def generate_student_certificate_pdf(
 # ---------------------------------------------------------
 # 4. STREAMLIT UI, EDUCATIONAL THEME & AUTHENTICATION
 # ---------------------------------------------------------
+def _focus_next_field_js():
+    st.components.v1.html(
+        """
+        <script>
+        (function() {
+            const doc = window.parent.document;
+            if (doc.__enterNavBound) return;
+            doc.__enterNavBound = true;
+            function advanceFrom(el) {
+                const inputs = Array.from(doc.querySelectorAll('input[type="text"], input[type="number"], textarea'))
+                    .filter(item => !item.disabled && item.offsetParent !== null);
+                const idx = inputs.indexOf(el);
+                if (idx >= 0 && idx < inputs.length - 1) {
+                    const nextEl = inputs[idx + 1];
+                    nextEl.scrollIntoView({ behavior: "smooth", block: "center" });
+                    setTimeout(() => {
+                        nextEl.focus();
+                        if (typeof nextEl.select === "function" && nextEl.tagName === "INPUT") {
+                            nextEl.select();
+                        }
+                    }, 30);
+                }
+            }
+            doc.addEventListener("keydown", function(e) {
+                if (e.key !== "Enter" && e.keyCode !== 13) return;
+                const active = doc.activeElement;
+                if (!active) return;
+                if (active.tagName === "INPUT" && (active.type === "text" || active.type === "number")) {
+                    e.preventDefault();
+                    advanceFrom(active);
+                }
+            }, true);
+        })();
+        </script>
+        """,
+        height=0,
+    )
+
+
+def focus_required_input(label_text: str):
+    """Moves focus/cursor back to the missing required input field without clearing cached/entered values."""
+    import json
+    safe_label = json.dumps(label_text)
+    st.components.v1.html(
+        f"""
+        <script>
+        (function() {{
+            const doc = window.parent.document;
+            const targetText = ({safe_label}).toLowerCase().trim();
+            const containers = Array.from(doc.querySelectorAll('[data-testid="stTextInput"], [data-testid="stTextArea"], [data-testid="stNumberInput"]'));
+            for (const box of containers) {{
+                const lbl = box.querySelector('label');
+                const txt = (lbl ? lbl.innerText : box.innerText || '').toLowerCase().trim();
+                if (txt.includes(targetText)) {{
+                    const field = box.querySelector('input, textarea');
+                    if (field && !field.disabled) {{
+                        box.scrollIntoView({{ behavior: "smooth", block: "center" }});
+                        setTimeout(() => {{
+                            field.focus();
+                            if (typeof field.select === "function") {{
+                                field.select();
+                            }}
+                        }}, 60);
+                        break;
+                    }}
+                }}
+            }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+
 st.set_page_config(page_title=f"{SCHOOL_NAME} - SMS", page_icon="🏫", layout="wide")
 init_db()
 
@@ -1065,35 +1149,36 @@ if st.sidebar.button("Logout"):
 if user["role"] in ["Admin", "Manager"]:
     nav_options = [
         "📊 Dashboard, Gender Totals & Filters",
-        "📝 Student Registration & Edit",
+        "👥 Manage Staff & Roles",
         "👨‍🏫 Teacher Registration & Directory",
+        "📝 Student Registration & Edit",
         "👔 School Manager Profile & Timetable/Register",
         "🧮 Continuous Assessment & Score Entry",
+        "📄 Terminal Report Cards (PDF Export)",
         "🎓 Student Certificates & Term Honours",
-        "📥 CSV File Generator & Data Export",
         "💰 Fees, Teacher Salaries & Occasions/Incidents",
         "📬 Teacher Issues & Manager Replies",
-        "📄 Terminal Report Cards (PDF Export)",
-        "👥 Manage Staff & Roles",
+        "📥 CSV File Generator & Data Export",
     ]
 elif user["role"] == "Teacher":
     nav_options = [
         "📊 Dashboard, Gender Totals & Filters",
         "📖 Daily/Weekly Lessons & Remaining Topics",
         "🧮 Continuous Assessment & Score Entry",
-        "🎓 Student Certificates & Term Honours",
-        "📥 CSV File Generator & Data Export",
-        "📩 Report Issues to School Manager",
         "📄 Terminal Report Cards (PDF Export)",
+        "🎓 Student Certificates & Term Honours",
+        "📩 Report Issues to School Manager",
+        "📥 CSV File Generator & Data Export",
     ]
 else:  # Bursar
     nav_options = [
         "📊 Dashboard, Gender Totals & Filters",
-        "📥 CSV File Generator & Data Export",
         "💰 Fees, Teacher Salaries & Occasions/Incidents",
+        "📥 CSV File Generator & Data Export",
     ]
 
 menu = st.sidebar.radio("System Modules", nav_options)
+_focus_next_field_js()
 
 
 # ---------------------------------------------------------
@@ -1263,7 +1348,7 @@ elif menu == "📝 Student Registration & Edit":
     tab_reg, tab_edit = st.tabs(["➕ Register New Learner", "✏️ Edit Existing Learner Entry"])
 
     with tab_reg:
-        with st.form("student_registration_form", clear_on_submit=True):
+        with st.form("student_registration_form", clear_on_submit=False):
             st.markdown("#### Learner Name & Auto Admission Number")
             n1, n2, n3 = st.columns(3)
             with n1:
@@ -1299,10 +1384,14 @@ elif menu == "📝 Student Registration & Edit":
             submitted = st.form_submit_button("Register Learner")
 
             if submitted:
-                if not confirm_reg:
+                if not surname.strip():
+                    st.error("Surname is required. Cursor moved back to Surname.")
+                    focus_required_input("Surname")
+                elif not first_name.strip():
+                    st.error("First Name is required. Cursor moved back to First Name.")
+                    focus_required_input("First Name")
+                elif not confirm_reg:
                     st.error("Please tick the confirmation box before submitting.")
-                elif not surname.strip() or not first_name.strip():
-                    st.error("Surname and First Name are required.")
                 else:
                     c.execute("SELECT COUNT(*) AS cnt FROM students")
                     seq = c.fetchone()["cnt"] + 1
@@ -1328,9 +1417,9 @@ elif menu == "📝 Student Registration & Edit":
                                 """,
                                 (
                                     adm_no,
-                                    surname.strip(),
-                                    first_name.strip(),
-                                    middle_name.strip(),
+                                    capitalize_initials(surname),
+                                    capitalize_initials(first_name),
+                                    capitalize_initials(middle_name),
                                     full_nm,
                                     gender,
                                     class_level,
@@ -1648,7 +1737,7 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
     conn = get_connection()
     c = conn.cursor()
 
-    with st.form("teacher_registration_form", clear_on_submit=True):
+    with st.form("teacher_registration_form", clear_on_submit=False):
         n1, n2, n3 = st.columns(3)
         with n1:
             t_surname = st.text_input("Teacher Surname *", placeholder="e.g., Osei")
@@ -1678,10 +1767,17 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
         assigned_cls_lvl = st.selectbox("Primary Class / Grade Level Assigned (Optional)", ["All / Multiple Classes"] + CLASS_LEVELS)
         confirm_t = st.checkbox("I confirm all teacher registration entries are accurate.")
         if st.form_submit_button("Register Teacher"):
-            if not confirm_t:
+            if not t_surname.strip():
+                st.error("Teacher Surname is required. Cursor moved back to Teacher Surname.")
+                focus_required_input("Teacher Surname")
+            elif not t_first.strip():
+                st.error("Teacher First Name is required. Cursor moved back to Teacher First Name.")
+                focus_required_input("Teacher First Name")
+            elif not staff_id.strip():
+                st.error("Teacher Staff ID is required. Cursor moved back to Teacher Staff ID.")
+                focus_required_input("Teacher Staff ID")
+            elif not confirm_t:
                 st.error("Please tick the confirmation box before submitting.")
-            elif not staff_id.strip() or not t_surname.strip() or not t_first.strip():
-                st.error("Staff ID, Surname, and First Name are required.")
             elif create_login and (not t_user.strip() or not t_pass.strip()):
                 st.error("Please provide Username and Password for the teacher portal login.")
             else:
@@ -1700,9 +1796,9 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
                         """,
                         (
                             staff_id.strip().upper(),
-                            t_surname.strip(),
-                            t_first.strip(),
-                            t_middle.strip(),
+                            capitalize_initials(t_surname),
+                            capitalize_initials(t_first),
+                            capitalize_initials(t_middle),
                             full_t_name,
                             t_gender,
                             t_phone.strip(),
@@ -1890,7 +1986,7 @@ elif menu == "📖 Daily/Weekly Lessons & Remaining Topics":
     conn = get_connection()
     c = conn.cursor()
 
-    with st.form("lesson_log_form", clear_on_submit=True):
+    with st.form("lesson_log_form", clear_on_submit=False):
         l1, l2, l3 = st.columns(3)
         with l1:
             l_class = st.selectbox("Class / Grade Level", CLASS_LEVELS)
@@ -1904,10 +2000,14 @@ elif menu == "📖 Daily/Weekly Lessons & Remaining Topics":
         confirm_l = st.checkbox("Confirm lesson coverage details before submitting.")
 
         if st.form_submit_button("Submit Lesson Log"):
-            if not confirm_l:
+            if not areas_taught.strip():
+                st.error("Areas / Topics Taught is required. Cursor moved back to Areas / Topics Taught.")
+                focus_required_input("Areas / Topics Taught")
+            elif not areas_left.strip():
+                st.error("Areas Left to Cover is required. Cursor moved back to Areas Left to Cover.")
+                focus_required_input("Areas Left to Cover")
+            elif not confirm_l:
                 st.error("Please tick confirmation before submitting.")
-            elif not areas_taught.strip() or not areas_left.strip():
-                st.error("Both Areas Taught and Areas Left to Cover are required.")
             else:
                 c.execute(
                     """
@@ -1950,37 +2050,7 @@ elif menu == "🧮 Continuous Assessment & Score Entry":
     st.header("Continuous Assessment (30% SBA) & Exam (70%) Entry")
     st.caption("Arrange class lists into rows and columns for direct entry, download/upload CSV or Excel (.xlsx/.xls) score sheets, and press Enter in score boxes to move to the next input field.")
 
-    # Keyboard Enter-to-next-input helper across score inputs
-    st.components.v1.html(
-        """
-        <script>
-        (function() {
-            const doc = window.parent.document;
-            if (doc.__enterNavBound) return;
-            doc.__enterNavBound = true;
-            doc.addEventListener("keydown", function(e) {
-                if (e.key !== "Enter") return;
-                const active = doc.activeElement;
-                if (!active) return;
-                const isInput = active.tagName === "INPUT" && (active.type === "text" || active.type === "number");
-                if (!isInput) return;
-                e.preventDefault();
-                const inputs = Array.from(doc.querySelectorAll('input[type="text"], input[type="number"]'))
-                    .filter(el => !el.disabled && el.offsetParent !== null);
-                const idx = inputs.indexOf(active);
-                if (idx >= 0 && idx < inputs.length - 1) {
-                    const nextEl = inputs[idx + 1];
-                    nextEl.focus();
-                    if (typeof nextEl.select === "function") {
-                        nextEl.select();
-                    }
-                }
-            }, true);
-        })();
-        </script>
-        """,
-        height=0,
-    )
+
 
     conn = get_connection()
     students = pd.read_sql_query(
@@ -2110,13 +2180,14 @@ elif menu == "🧮 Continuous Assessment & Score Entry":
         st.caption("Type scores in each row; pressing **Enter** moves directly to the next score input box.")
 
         with st.form("class_grid_assessment_form"):
-            hdr1, hdr2, hdr3, hdr4, hdr5, hdr6 = st.columns([2.6, 1.1, 1.1, 1.1, 1.2, 1.3])
+            hdr1, hdr2, hdr3, hdr4, hdr5, hdr6, hdr7 = st.columns([2.2, 0.95, 0.95, 0.95, 1.0, 1.15, 1.25])
             hdr1.markdown("**Learner (Adm. No. — Name)**")
             hdr2.markdown("**Test 1 (/20)**")
             hdr3.markdown("**Test 2 (/20)**")
             hdr4.markdown("**Project (/20)**")
             hdr5.markdown("**Exam (/100)**")
-            hdr6.markdown("**Total & Grade**")
+            hdr6.markdown("**Overall Score**")
+            hdr7.markdown("**Total & Grade**")
 
             row_widgets = []
             for _, sr in cls_students.iterrows():
@@ -2135,8 +2206,10 @@ elif menu == "🧮 Continuous Assessment & Score Entry":
                     st.session_state[f"sc_pj_{sid}"] = def_pj
                 if f"sc_ex_{sid}" not in st.session_state:
                     st.session_state[f"sc_ex_{sid}"] = def_ex
+                if f"sc_ovr_{sid}" not in st.session_state:
+                    st.session_state[f"sc_ovr_{sid}"] = "100"
 
-                c_nm, c_t1, c_t2, c_pj, c_ex, c_tot = st.columns([2.6, 1.1, 1.1, 1.1, 1.2, 1.3])
+                c_nm, c_t1, c_t2, c_pj, c_ex, c_ovr, c_tot = st.columns([2.2, 0.95, 0.95, 0.95, 1.0, 1.15, 1.25])
                 with c_nm:
                     st.markdown(f"**{sr['full_name']}** (`{sid}`)")
                 with c_t1:
@@ -2147,20 +2220,25 @@ elif menu == "🧮 Continuous Assessment & Score Entry":
                     w_pj = st.text_input("Proj", key=f"sc_pj_{sid}", label_visibility="collapsed")
                 with c_ex:
                     w_ex = st.text_input("Exam", key=f"sc_ex_{sid}", label_visibility="collapsed")
+                with c_ovr:
+                    w_ovr = st.text_input("Overall Score", key=f"sc_ovr_{sid}", label_visibility="collapsed")
 
                 try:
+                    ovr_cap = max(0.0, min(100.0, float(w_ovr or 100.0)))
                     pv_t1 = max(0.0, min(20.0, float(w_t1 or 0)))
                     pv_t2 = max(0.0, min(20.0, float(w_t2 or 0)))
                     pv_pj = max(0.0, min(20.0, float(w_pj or 0)))
                     pv_ex = max(0.0, min(100.0, float(w_ex or 0)))
-                    _, _, pv_tot, pv_grd, _ = compute_assessment(pv_t1, pv_t2, pv_pj, pv_ex)
+                    _, _, raw_pv_tot, _, _ = compute_assessment(pv_t1, pv_t2, pv_pj, pv_ex)
+                    pv_tot = round(min(raw_pv_tot, ovr_cap), 2)
+                    pv_grd, _ = calculate_wassce_grade(pv_tot)
                 except ValueError:
                     pv_tot, pv_grd = 0.0, "ERR"
 
                 with c_tot:
                     st.markdown(f"**{pv_tot}%** (`{pv_grd}`)")
 
-                row_widgets.append((sid, sr["full_name"], w_t1, w_t2, w_pj, w_ex))
+                row_widgets.append((sid, sr["full_name"], w_t1, w_t2, w_pj, w_ex, w_ovr))
 
             confirm_sc = st.checkbox("Confirm all class scores before saving to database.", key="conf_class_grid_save")
             if st.form_submit_button("Save All Class Scores"):
@@ -2171,12 +2249,15 @@ elif menu == "🧮 Continuous Assessment & Score Entry":
                         create_db_backup("class_scores_save")
                         c = conn.cursor()
                         saved_cnt = 0
-                        for sid, _, raw_t1, raw_t2, raw_pj, raw_ex in row_widgets:
+                        for sid, _, raw_t1, raw_t2, raw_pj, raw_ex, raw_ovr in row_widgets:
+                            ovr_cap = max(0.0, min(100.0, float(raw_ovr or 100.0)))
                             t1 = max(0.0, min(20.0, float(raw_t1 or 0)))
                             t2 = max(0.0, min(20.0, float(raw_t2 or 0)))
                             proj = max(0.0, min(20.0, float(raw_pj or 0)))
                             exam_raw = max(0.0, min(100.0, float(raw_ex or 0)))
-                            sba_w, exam_w, total, grade, remark = compute_assessment(t1, t2, proj, exam_raw)
+                            sba_w, exam_w, raw_total, _, _ = compute_assessment(t1, t2, proj, exam_raw)
+                            total = round(min(raw_total, ovr_cap), 2)
+                            grade, remark = calculate_wassce_grade(total)
                             c.execute(
                                 """
                                 INSERT INTO assessments (
