@@ -266,6 +266,12 @@ def format_full_name(surname: str, first_name: str, middle_name: str = "") -> st
     return " ".join(parts)
 
 
+def capitalize_name_widget(key: str):
+    """Title-case a name input when the user leaves the field or presses Enter."""
+    value = st.session_state.get(key, "")
+    st.session_state[key] = capitalize_initials(str(value))
+
+
 def save_teacher_class_assignments(conn, staff_id: str, class_levels: list):
     """Replace a teacher's class allocations atomically; an empty list means all classes."""
     valid_levels = list(dict.fromkeys(level for level in (class_levels or []) if level in CLASS_LEVELS))
@@ -1725,16 +1731,19 @@ elif menu == "📝 Student Registration & Edit":
     tab_reg, tab_edit = st.tabs(["➕ Register New Learner", "✏️ Edit Existing Learner Entry"])
 
     with tab_reg:
-        with st.form("student_registration_form", clear_on_submit=False):
-            st.markdown("#### Learner Name & Auto Admission Number")
-            n1, n2, n3 = st.columns(3)
-            with n1:
-                surname = st.text_input("Surname *", placeholder="e.g., Mensah")
-            with n2:
-                first_name = st.text_input("First Name *", placeholder="e.g., Kwame")
-            with n3:
-                middle_name = st.text_input("Middle Name (Optional)", placeholder="e.g., Boateng")
+        st.markdown("#### Learner Name & Auto Admission Number")
+        n1, n2, n3 = st.columns(3)
+        with n1:
+            st.text_input("Surname *", placeholder="e.g., Mensah", key="reg_student_surname", on_change=capitalize_name_widget, args=("reg_student_surname",))
+        with n2:
+            st.text_input("First Name *", placeholder="e.g., Kwame", key="reg_student_first_name", on_change=capitalize_name_widget, args=("reg_student_first_name",))
+        with n3:
+            st.text_input("Middle Name (Optional)", placeholder="e.g., Boateng", key="reg_student_middle_name", on_change=capitalize_name_widget, args=("reg_student_middle_name",))
+        surname = st.session_state.get("reg_student_surname", "")
+        first_name = st.session_state.get("reg_student_first_name", "")
+        middle_name = st.session_state.get("reg_student_middle_name", "")
 
+        with st.form("student_registration_form", clear_on_submit=False):
             a1, a2 = st.columns(2)
             with a1:
                 auto_gen = st.checkbox("Auto-generate Admission Number from Name + Number", value=True)
@@ -2601,272 +2610,237 @@ elif menu == "📖 Daily/Weekly Lessons & Remaining Topics":
 # ---------------------------------------------------------
 elif menu == "🧮 Continuous Assessment & Score Entry":
     st.header("Continuous Assessment (30% SBA) & Exam (70%) Entry")
-    st.caption("Arrange class lists into rows and columns for direct entry, download/upload CSV or Excel (.xlsx/.xls) score sheets, and press Enter in score boxes to move to the next input field.")
-
-
+    st.caption("Select a class to load every active learner and every subject scheduled for that class. Enter scores directly or download, complete and upload the class CSV template.")
 
     conn = get_connection()
     students = pd.read_sql_query(
         "SELECT student_id, full_name, class_level, program FROM students WHERE status = 'Active' ORDER BY class_level, full_name",
         conn,
     )
-
     if students.empty:
         st.warning("Please register learners first.")
     else:
-        top1, top2, top3 = st.columns(3)
-        with top1:
-            term = st.selectbox("Academic Term", ["2026/2027 - Term 1", "2026/2027 - Term 2", "2026/2027 - Term 3"], key="ass_term_sel")
-        with top2:
-            _teacher_subject = user.get("assigned_subject")
-            _assessment_subjects = [_teacher_subject] if user["role"] in ("Teacher", "ICT Teacher") and _teacher_subject in SUBJECTS_LIST else SUBJECTS_LIST
-            subject = st.selectbox("Subject", _assessment_subjects, key="ass_sub_sel")
-        with top3:
-            class_choices = sorted(students["class_level"].dropna().unique().tolist())
-            if user["role"] in ("Teacher", "ICT Teacher"):
-                permitted_classes = set(get_teacher_assigned_classes(conn, user["username"]))
-                class_choices = [level for level in class_choices if level in permitted_classes]
-            if not class_choices:
-                st.warning("No active learners are registered in the class levels assigned to this account.")
-                conn.close()
-                st.stop()
-            selected_cls = st.selectbox("Select Class / Grade Level", class_choices, key="ass_cls_sel")
+        term = st.selectbox("Academic Term", ["2026/2027 - Term 1", "2026/2027 - Term 2", "2026/2027 - Term 3"], key="ass_term_sel")
+        class_choices = sorted(students["class_level"].dropna().unique().tolist())
+        if user["role"] in ("Teacher", "ICT Teacher"):
+            permitted_classes = set(get_teacher_assigned_classes(conn, user["username"]))
+            class_choices = [level for level in class_choices if level in permitted_classes]
+        if not class_choices:
+            st.warning("No active learners are registered in the class levels assigned to this account.")
+            conn.close()
+            st.stop()
+        selected_cls = st.selectbox("Select Class / Grade Level", class_choices, key="ass_cls_sel")
+        cls_students = students[students["class_level"] == selected_cls].copy().reset_index(drop=True)
 
-        cls_students = students[students["class_level"] == selected_cls].reset_index(drop=True)
-        existing_scores_df = pd.read_sql_query(
-            "SELECT student_id, class_test_1, class_test_2, project_work, exam_raw FROM assessments WHERE term = ? AND subject = ?",
-            conn,
-            params=(term, subject),
+        # Use the subjects actually scheduled for this class. If no timetable exists yet,
+        # fall back to the school's configured subject list so score entry remains available.
+        timetable_subjects = pd.read_sql_query(
+            "SELECT DISTINCT subject FROM school_timetable WHERE class_level = ? ORDER BY subject",
+            conn, params=(selected_cls,)
+        )["subject"].dropna().astype(str).tolist()
+        class_subjects = timetable_subjects or list(SUBJECTS_LIST)
+        if user["role"] in ("Teacher", "ICT Teacher"):
+            assigned_subject = (user.get("assigned_subject") or "").strip()
+            class_subjects = [x for x in class_subjects if x == assigned_subject]
+        if not class_subjects:
+            st.warning("No subjects are available for this class and staff account. Check the class timetable and teacher subject assignment.")
+            conn.close()
+            st.stop()
+
+        st.info(f"Loaded **{len(cls_students)} learner(s)** and **{len(class_subjects)} subject(s)** for **{selected_cls}**.")
+        st.caption("The class timetable determines the class subject list. This version does not yet store separate elective-subject combinations for individual learners.")
+
+        existing_df = pd.read_sql_query(
+            "SELECT student_id, term, subject, class_test_1, class_test_2, project_work, exam_raw FROM assessments WHERE term = ?",
+            conn, params=(term,)
         )
-        existing_map = {r["student_id"]: dict(r) for _, r in existing_scores_df.iterrows()}
+        existing_map = {(r["student_id"], r["subject"]): dict(r) for _, r in existing_df.iterrows()}
 
-        roster_rows = []
-        for _, sr in cls_students.iterrows():
-            ex = existing_map.get(sr["student_id"], {})
-            roster_rows.append(
-                {
-                    "Admission_No": sr["student_id"],
-                    "Learner_Name": sr["full_name"],
-                    "Class_Level": sr["class_level"],
-                    "Term": term,
-                    "Subject": subject,
-                    "Class_Test_1_Max20": float(ex.get("class_test_1", 0.0) or 0.0),
-                    "Class_Test_2_Max20": float(ex.get("class_test_2", 0.0) or 0.0),
-                    "Project_Work_Max20": float(ex.get("project_work", 0.0) or 0.0),
-                    "Exam_Raw_Max100": float(ex.get("exam_raw", 0.0) or 0.0),
-                }
-            )
-        roster_df = pd.DataFrame(roster_rows)
+        def _score_row(sid, student_name, subj):
+            ex = existing_map.get((sid, subj), {})
+            return {
+                "Admission_No": sid, "Learner_Name": student_name, "Class_Level": selected_cls,
+                "Subject": subj, "Term": term,
+                "Class_Test_1_Max20": float(ex.get("class_test_1", 0) or 0),
+                "Class_Test_2_Max20": float(ex.get("class_test_2", 0) or 0),
+                "Project_Work_Max20": float(ex.get("project_work", 0) or 0),
+                "Exam_Raw_Max100": float(ex.get("exam_raw", 0) or 0),
+                "Overall_Max100": 100.0,
+            }
 
-        csv_buf = io.StringIO()
-        roster_df.to_csv(csv_buf, index=False)
-        csv_filename = f"{re.sub(r'[^A-Za-z0-9_]+', '_', selected_cls)}_{re.sub(r'[^A-Za-z0-9_]+', '_', subject)}_Scores.csv"
+        template_rows = [_score_row(r["student_id"], r["full_name"], subj)
+                         for _, r in cls_students.iterrows() for subj in class_subjects]
+        template_df = pd.DataFrame(template_rows)
+        csv_buffer = io.StringIO()
+        template_df.to_csv(csv_buffer, index=False)
+        safe_cls = re.sub(r"[^A-Za-z0-9_]+", "_", selected_cls)
+        csv_filename = f"{safe_cls}_ALL_SUBJECTS_{term.replace('/', '-')}_Assessment.csv"
         st.download_button(
-            label=f"📥 Download Class Score CSV for Excel ({csv_filename})",
-            data=csv_buf.getvalue().encode("utf-8"),
-            file_name=csv_filename,
-            mime="text/csv",
+            "📥 Download Complete Class Assessment CSV",
+            data=csv_buffer.getvalue().encode("utf-8-sig"), file_name=csv_filename, mime="text/csv",
+            help="This editable CSV contains every active learner and every subject scheduled for the selected class."
         )
+        st.caption("CSV files cannot be encrypted and remain directly editable in Excel at the same time. The uploaded file is therefore validated strictly by the app; invalid or over-limit scores are rejected, never silently reduced.")
 
         uploaded_sheet = st.file_uploader(
-            "📤 Upload Recorded Excel (.xlsx / .xls) or CSV Score Sheet (Auto-Fills Scores Below)",
-            type=["xlsx", "xls", "csv"],
-            key="ass_excel_csv_upload",
+            "📤 Upload completed class assessment CSV / Excel file",
+            type=["csv", "xlsx", "xls"], key="ass_all_subjects_upload"
         )
-
         if uploaded_sheet is not None:
-            upload_key_sig = f"{uploaded_sheet.name}_{uploaded_sheet.size}_{term}_{subject}_{selected_cls}"
-            if st.session_state.get("last_loaded_score_sheet") != upload_key_sig:
+            upload_sig = hashlib.sha256(uploaded_sheet.getvalue()).hexdigest() + f":{term}:{selected_cls}"
+            if st.session_state.get("last_all_subjects_upload") != upload_sig:
                 try:
-                    if uploaded_sheet.name.lower().endswith(".csv"):
-                        up_df = pd.read_csv(uploaded_sheet)
+                    up_df = pd.read_csv(uploaded_sheet) if uploaded_sheet.name.lower().endswith(".csv") else pd.read_excel(uploaded_sheet)
+                    required = {"Admission_No", "Subject", "Class_Test_1_Max20", "Class_Test_2_Max20", "Project_Work_Max20", "Exam_Raw_Max100", "Overall_Max100"}
+                    missing = sorted(required - set(up_df.columns))
+                    errors, parsed_rows = [], []
+                    if missing:
+                        errors.append("Missing required column(s): " + ", ".join(missing))
                     else:
-                        up_df = pd.read_excel(uploaded_sheet)
-
-                    col_lookup = {str(col).strip().lower(): col for col in up_df.columns}
-
-                    def _pick_col(candidates):
-                        for cand in candidates:
-                            if cand in col_lookup:
-                                return col_lookup[cand]
-                        for k, orig in col_lookup.items():
-                            for cand in candidates:
-                                if cand in k:
-                                    return orig
-                        return None
-
-                    id_col = _pick_col(["admission_no", "adm. no.", "adm_no", "student_id", "id"])
-                    name_col = _pick_col(["learner_name", "learner name", "full_name", "student_name", "name"])
-                    t1_col = _pick_col(["class_test_1_max20", "class_test_1", "test 1", "test1", "t1"])
-                    t2_col = _pick_col(["class_test_2_max20", "class_test_2", "test 2", "test2", "t2"])
-                    pj_col = _pick_col(["project_work_max20", "project_work", "project", "proj"])
-                    ex_col = _pick_col(["exam_raw_max100", "exam_raw", "exam", "exam_score"])
-
-                    applied_count = 0
-                    for _, urow in up_df.iterrows():
-                        matched_sid = None
-                        if id_col and pd.notna(urow[id_col]):
-                            cand_id = str(urow[id_col]).strip()
-                            if cand_id in cls_students["student_id"].values:
-                                matched_sid = cand_id
-                        if not matched_sid and name_col and pd.notna(urow[name_col]):
-                            cand_nm = str(urow[name_col]).strip().lower()
-                            hit = cls_students[cls_students["full_name"].str.lower() == cand_nm]
-                            if not hit.empty:
-                                matched_sid = hit.iloc[0]["student_id"]
-
-                        if matched_sid:
-                            v_t1 = float(pd.to_numeric(urow[t1_col], errors="coerce")) if (t1_col and pd.notna(urow[t1_col])) else 0.0
-                            v_t2 = float(pd.to_numeric(urow[t2_col], errors="coerce")) if (t2_col and pd.notna(urow[t2_col])) else 0.0
-                            v_pj = float(pd.to_numeric(urow[pj_col], errors="coerce")) if (pj_col and pd.notna(urow[pj_col])) else 0.0
-                            v_ex = float(pd.to_numeric(urow[ex_col], errors="coerce")) if (ex_col and pd.notna(urow[ex_col])) else 0.0
-
-                            v_t1 = max(0.0, min(20.0, 0.0 if pd.isna(v_t1) else v_t1))
-                            v_t2 = max(0.0, min(20.0, 0.0 if pd.isna(v_t2) else v_t2))
-                            v_pj = max(0.0, min(20.0, 0.0 if pd.isna(v_pj) else v_pj))
-                            v_ex = max(0.0, min(100.0, 0.0 if pd.isna(v_ex) else v_ex))
-
-                            st.session_state[f"sc_t1_{matched_sid}"] = f"{v_t1:g}"
-                            st.session_state[f"sc_t2_{matched_sid}"] = f"{v_t2:g}"
-                            st.session_state[f"sc_pj_{matched_sid}"] = f"{v_pj:g}"
-                            st.session_state[f"sc_ex_{matched_sid}"] = f"{v_ex:g}"
-                            applied_count += 1
-
-                    st.session_state["last_loaded_score_sheet"] = upload_key_sig
-                    st.success(f"Auto-filled scores for **{applied_count}** student(s) from `{uploaded_sheet.name}`! Review below and click **Save All Class Scores**.")
-                except Exception as up_err:
-                    st.error(f"Could not read uploaded sheet: {up_err}")
+                        valid_ids = set(cls_students["student_id"].astype(str))
+                        valid_subjects = set(class_subjects)
+                        seen = set()
+                        limits = {"Class_Test_1_Max20": 20.0, "Class_Test_2_Max20": 20.0, "Project_Work_Max20": 20.0, "Exam_Raw_Max100": 100.0, "Overall_Max100": 100.0}
+                        for ridx, row in up_df.iterrows():
+                            sid = str(row.get("Admission_No", "")).strip()
+                            subj = str(row.get("Subject", "")).strip()
+                            if sid not in valid_ids or subj not in valid_subjects:
+                                errors.append(f"Row {ridx + 2}: learner or subject does not belong to the selected class.")
+                                continue
+                            pair = (sid, subj)
+                            if pair in seen:
+                                errors.append(f"Row {ridx + 2}: duplicate learner/subject entry ({sid}, {subj}).")
+                                continue
+                            seen.add(pair)
+                            values = {}
+                            for col, maximum in limits.items():
+                                try:
+                                    raw = row.get(col, 0)
+                                    value = 0.0 if pd.isna(raw) or str(raw).strip() == "" else float(raw)
+                                    if not math.isfinite(value) or value < 0 or value > maximum:
+                                        errors.append(f"Row {ridx + 2}: {col} must be between 0 and {maximum:g}. Values cannot be greater than the overall/maximum score.")
+                                    values[col] = value
+                                except (TypeError, ValueError):
+                                    errors.append(f"Row {ridx + 2}: {col} must contain a valid number.")
+                            if len(values) == len(limits):
+                                parsed_rows.append((sid, subj, values))
+                        expected_pairs = {(str(r["student_id"]), subj) for _, r in cls_students.iterrows() for subj in class_subjects}
+                        missing_pairs = expected_pairs - seen
+                        if missing_pairs:
+                            errors.append(f"The file is missing {len(missing_pairs)} learner/subject row(s). Please use the complete downloaded template.")
+                    if errors:
+                        st.error("The assessment file was rejected. Correct the following before uploading again:")
+                        for msg in errors[:30]:
+                            st.write(f"- {msg}")
+                        if len(errors) > 30:
+                            st.write(f"...and {len(errors) - 30} more error(s).")
+                    else:
+                        for sid, subj, vals in parsed_rows:
+                            prefix = f"ass_{sid}_{re.sub(r'[^A-Za-z0-9]+', '_', subj)}"
+                            st.session_state[f"{prefix}_t1"] = f"{vals['Class_Test_1_Max20']:g}"
+                            st.session_state[f"{prefix}_t2"] = f"{vals['Class_Test_2_Max20']:g}"
+                            st.session_state[f"{prefix}_pj"] = f"{vals['Project_Work_Max20']:g}"
+                            st.session_state[f"{prefix}_ex"] = f"{vals['Exam_Raw_Max100']:g}"
+                            st.session_state[f"{prefix}_ovr"] = f"{vals['Overall_Max100']:g}"
+                        st.session_state["last_all_subjects_upload"] = upload_sig
+                        st.success(f"Validated and loaded {len(parsed_rows)} learner/subject score row(s). Review the grid and save.")
+                except Exception as upload_error:
+                    st.error(f"Could not read the uploaded assessment file: {upload_error}")
 
         st.divider()
-        st.subheader(f"📋 Class Score Grid — {selected_cls} ({subject} • {term})")
-        st.caption("Type scores in each row; pressing **Enter** moves directly to the next score input box.")
+        st.subheader(f"📋 Full Class Assessment Grid — {selected_cls} ({term})")
+        st.caption("Enter all subjects for each learner. Test and project maximums are 20 each; the examination maximum is 100; overall maximum is 100.")
+        rows_to_save = []
+        with st.form("class_all_subjects_assessment_form"):
+            for subj in class_subjects:
+                st.markdown(f"#### {subj}")
+                h = st.columns([2.2, 0.8, 0.8, 0.8, 0.85, 0.9, 1.0])
+                for col, label in zip(h, ["Learner", "Test 1 /20", "Test 2 /20", "Project /20", "Exam /100", "Overall /100", "Computed total"]):
+                    col.markdown(f"**{label}**")
+                for _, sr in cls_students.iterrows():
+                    sid, nm = str(sr["student_id"]), str(sr["full_name"])
+                    ex = existing_map.get((sid, subj), {})
+                    prefix = f"ass_{sid}_{re.sub(r'[^A-Za-z0-9]+', '_', subj)}"
+                    defaults = {"t1": ex.get("class_test_1", 0), "t2": ex.get("class_test_2", 0), "pj": ex.get("project_work", 0), "ex": ex.get("exam_raw", 0), "ovr": 100}
+                    for suffix, default in defaults.items():
+                        key = f"{prefix}_{suffix}"
+                        if key not in st.session_state:
+                            st.session_state[key] = f"{float(default or 0):g}"
+                    cols = st.columns([2.2, 0.8, 0.8, 0.8, 0.85, 0.9, 1.0])
+                    cols[0].markdown(f"{nm} (`{sid}`)")
+                    raw = {}
+                    for col, suffix, label in zip(cols[1:6], ["t1", "t2", "pj", "ex", "ovr"], ["T1", "T2", "Project", "Exam", "Overall"]):
+                        raw[suffix] = col.text_input(label, key=f"{prefix}_{suffix}", label_visibility="collapsed")
+                    try:
+                        nums = {k: float(v or 0) for k, v in raw.items()}
+                        total = compute_assessment(nums["t1"], nums["t2"], nums["pj"], nums["ex"])[2]
+                        grade, _ = calculate_wassce_grade(total)
+                        cols[6].markdown(f"**{total:.2f}%** ({grade})")
+                    except (TypeError, ValueError):
+                        total, grade = None, "ERR"
+                        cols[6].error("Invalid")
+                    rows_to_save.append((sid, nm, subj, prefix))
+            confirm_sc = st.checkbox("I have checked the scores for all learners and subjects.", key="conf_all_subjects_save")
+            save_all = st.form_submit_button("Save All Class Assessment Scores")
 
-        with st.form("class_grid_assessment_form"):
-            hdr1, hdr2, hdr3, hdr4, hdr5, hdr6, hdr7 = st.columns([2.2, 0.95, 0.95, 0.95, 1.0, 1.15, 1.25])
-            hdr1.markdown("**Learner (Adm. No. — Name)**")
-            hdr2.markdown("**Test 1 (/20)**")
-            hdr3.markdown("**Test 2 (/20)**")
-            hdr4.markdown("**Project (/20)**")
-            hdr5.markdown("**Exam (/100)**")
-            hdr6.markdown("**Overall Score**")
-            hdr7.markdown("**Total & Grade**")
-
-            row_widgets = []
-            for _, sr in cls_students.iterrows():
-                sid = sr["student_id"]
-                ex = existing_map.get(sid, {})
-                def_t1 = f"{float(ex.get('class_test_1', 0.0) or 0.0):g}"
-                def_t2 = f"{float(ex.get('class_test_2', 0.0) or 0.0):g}"
-                def_pj = f"{float(ex.get('project_work', 0.0) or 0.0):g}"
-                def_ex = f"{float(ex.get('exam_raw', 0.0) or 0.0):g}"
-
-                if f"sc_t1_{sid}" not in st.session_state:
-                    st.session_state[f"sc_t1_{sid}"] = def_t1
-                if f"sc_t2_{sid}" not in st.session_state:
-                    st.session_state[f"sc_t2_{sid}"] = def_t2
-                if f"sc_pj_{sid}" not in st.session_state:
-                    st.session_state[f"sc_pj_{sid}"] = def_pj
-                if f"sc_ex_{sid}" not in st.session_state:
-                    st.session_state[f"sc_ex_{sid}"] = def_ex
-                if f"sc_ovr_{sid}" not in st.session_state:
-                    st.session_state[f"sc_ovr_{sid}"] = "100"
-
-                c_nm, c_t1, c_t2, c_pj, c_ex, c_ovr, c_tot = st.columns([2.2, 0.95, 0.95, 0.95, 1.0, 1.15, 1.25])
-                with c_nm:
-                    st.markdown(f"**{sr['full_name']}** (`{sid}`)")
-                with c_t1:
-                    w_t1 = st.text_input("T1", key=f"sc_t1_{sid}", label_visibility="collapsed")
-                with c_t2:
-                    w_t2 = st.text_input("T2", key=f"sc_t2_{sid}", label_visibility="collapsed")
-                with c_pj:
-                    w_pj = st.text_input("Proj", key=f"sc_pj_{sid}", label_visibility="collapsed")
-                with c_ex:
-                    w_ex = st.text_input("Exam", key=f"sc_ex_{sid}", label_visibility="collapsed")
-                with c_ovr:
-                    w_ovr = st.text_input("Overall Score", key=f"sc_ovr_{sid}", label_visibility="collapsed")
-
-                try:
-                    ovr_cap = max(0.0, min(100.0, float(w_ovr or 100.0)))
-                    pv_t1 = max(0.0, min(20.0, float(w_t1 or 0)))
-                    pv_t2 = max(0.0, min(20.0, float(w_t2 or 0)))
-                    pv_pj = max(0.0, min(20.0, float(w_pj or 0)))
-                    pv_ex = max(0.0, min(100.0, float(w_ex or 0)))
-                    _, _, raw_pv_tot, _, _ = compute_assessment(pv_t1, pv_t2, pv_pj, pv_ex)
-                    pv_tot = round(min(raw_pv_tot, ovr_cap), 2)
-                    pv_grd, _ = calculate_wassce_grade(pv_tot)
-                except ValueError:
-                    pv_tot, pv_grd = 0.0, "ERR"
-
-                with c_tot:
-                    st.markdown(f"**{pv_tot}%** (`{pv_grd}`)")
-
-                row_widgets.append((sid, sr["full_name"], w_t1, w_t2, w_pj, w_ex, w_ovr))
-
-            confirm_sc = st.checkbox("Confirm all class scores before saving to database.", key="conf_class_grid_save")
-            if st.form_submit_button("Save All Class Scores"):
-                if not confirm_sc:
-                    st.error("Please tick confirmation before saving scores.")
+        if save_all:
+            if not confirm_sc:
+                st.error("Please confirm the scores before saving.")
+            else:
+                validation_errors = []
+                validated = []
+                for sid, nm, subj, prefix in rows_to_save:
+                    try:
+                        values = {suffix: float(st.session_state.get(f"{prefix}_{suffix}", "0") or 0) for suffix in ("t1", "t2", "pj", "ex", "ovr")}
+                        caps = {"t1": 20, "t2": 20, "pj": 20, "ex": 100, "ovr": 100}
+                        for suffix, cap in caps.items():
+                            val = values[suffix]
+                            if not math.isfinite(val) or val < 0 or val > cap:
+                                validation_errors.append(f"{nm} — {subj}: {suffix.upper()} must be between 0 and {cap}. Values cannot be greater than the overall/maximum score.")
+                        weighted = compute_assessment(values["t1"], values["t2"], values["pj"], values["ex"] )
+                        if weighted[2] > values["ovr"]:
+                            validation_errors.append(f"{nm} — {subj}: computed total {weighted[2]:.2f} is greater than Overall ({values['ovr']:g}).")
+                        validated.append((sid, subj, values, weighted))
+                    except (TypeError, ValueError, OverflowError):
+                        validation_errors.append(f"{nm} — {subj}: enter valid numeric scores in every field.")
+                if validation_errors:
+                    st.error("Scores were not saved. Correct these errors first:")
+                    for msg in validation_errors[:30]:
+                        st.write(f"- {msg}")
+                    if len(validation_errors) > 30:
+                        st.write(f"...and {len(validation_errors) - 30} more error(s).")
                 else:
                     try:
-                        create_db_backup("class_scores_save")
-                        c = conn.cursor()
-                        saved_cnt = 0
-                        for sid, _, raw_t1, raw_t2, raw_pj, raw_ex, raw_ovr in row_widgets:
-                            ovr_cap = max(0.0, min(100.0, float(raw_ovr or 100.0)))
-                            t1 = max(0.0, min(20.0, float(raw_t1 or 0)))
-                            t2 = max(0.0, min(20.0, float(raw_t2 or 0)))
-                            proj = max(0.0, min(20.0, float(raw_pj or 0)))
-                            exam_raw = max(0.0, min(100.0, float(raw_ex or 0)))
-                            sba_w, exam_w, raw_total, _, _ = compute_assessment(t1, t2, proj, exam_raw)
-                            total = round(min(raw_total, ovr_cap), 2)
-                            grade, remark = calculate_wassce_grade(total)
-                            c.execute(
-                                """
-                                INSERT INTO assessments (
-                                    student_id, term, subject, class_test_1, class_test_2, project_work,
-                                    exam_raw, sba_weighted, exam_weighted, total_score, grade, remark
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        create_db_backup("class_all_subjects_scores_save")
+                        cur = conn.cursor()
+                        for sid, subj, values, weighted in validated:
+                            sba_w, exam_w, total, grade, remark = weighted
+                            cur.execute("""
+                                INSERT INTO assessments (student_id, term, subject, class_test_1, class_test_2, project_work, exam_raw, sba_weighted, exam_weighted, total_score, grade, remark)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 ON CONFLICT(student_id, term, subject) DO UPDATE SET
-                                    class_test_1=excluded.class_test_1,
-                                    class_test_2=excluded.class_test_2,
-                                    project_work=excluded.project_work,
-                                    exam_raw=excluded.exam_raw,
-                                    sba_weighted=excluded.sba_weighted,
-                                    exam_weighted=excluded.exam_weighted,
-                                    total_score=excluded.total_score,
-                                    grade=excluded.grade,
-                                    remark=excluded.remark
-                                """,
-                                (sid, term, subject, t1, t2, proj, exam_raw, sba_w, exam_w, total, grade, remark),
-                            )
-                            saved_cnt += 1
+                                  class_test_1=excluded.class_test_1, class_test_2=excluded.class_test_2, project_work=excluded.project_work,
+                                  exam_raw=excluded.exam_raw, sba_weighted=excluded.sba_weighted, exam_weighted=excluded.exam_weighted,
+                                  total_score=excluded.total_score, grade=excluded.grade, remark=excluded.remark
+                            """, (sid, term, subj, values["t1"], values["t2"], values["pj"], values["ex"], sba_w, exam_w, total, grade, remark))
                         conn.commit()
-                        st.success(f"Saved scores for **{saved_cnt}** learner(s) in **{selected_cls}** ({subject} • {term})!")
-                    except Exception as save_err:
+                        write_audit_log(conn, user["username"], user["role"], "Class assessments saved", f"{selected_cls} | {term} | {len(validated)} learner-subject records")
+                        conn.commit()
+                        st.success(f"Saved {len(validated)} assessment record(s) for {selected_cls}.")
+                    except Exception as save_error:
                         conn.rollback()
-                        st.error(f"Error saving scores: {save_err}")
+                        st.error(f"Could not save the class assessments: {save_error}")
 
-        broad_df = pd.read_sql_query(
-            """
-            SELECT a.student_id AS 'Adm. No.', s.full_name AS 'Learner Name', s.class_level AS 'Class',
-                   a.term AS 'Term', a.subject AS 'Subject', a.sba_weighted AS 'SBA (30%)',
-                   a.exam_weighted AS 'Exam (70%)', a.total_score AS 'Total (100%)',
-                   a.grade AS 'Grade', a.remark AS 'Remark'
-            FROM assessments a JOIN students s ON a.student_id = s.student_id
-            WHERE a.term = ? AND a.subject = ? AND s.class_level = ?
-            ORDER BY a.total_score DESC
-            """,
-            conn,
-            params=(term, subject, selected_cls),
+        recorded_df = pd.read_sql_query(
+            "SELECT a.student_id AS 'Admission No.', s.full_name AS 'Learner Name', a.subject AS 'Subject', a.sba_weighted AS 'SBA (30%)', a.exam_weighted AS 'Exam (70%)', a.total_score AS 'Total (100%)', a.grade AS 'Grade', a.remark AS 'Remark' FROM assessments a JOIN students s ON a.student_id=s.student_id WHERE a.term=? AND s.class_level=? ORDER BY s.full_name, a.subject",
+            conn, params=(term, selected_cls)
         )
-        if not broad_df.empty:
-            st.subheader("Recorded Assessments for Selected Class & Subject")
-            st.dataframe(broad_df, use_container_width=True)
-
+        if not recorded_df.empty:
+            st.subheader("Recorded Class Assessments")
+            st.dataframe(recorded_df, use_container_width=True)
     conn.close()
 
 
-# ---------------------------------------------------------
 # MODULE 7: STUDENT CERTIFICATES OF COMPLETION & TERM HONOURS
 # ---------------------------------------------------------
 elif menu == "🎓 Student Certificates & Term Honours":
