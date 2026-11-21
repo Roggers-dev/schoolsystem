@@ -3,10 +3,14 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 import hashlib
+import hmac
+import secrets
 import re
 import io
 import os
 import tempfile
+import unicodedata
+import math
 from fpdf import FPDF
 
 # ---------------------------------------------------------
@@ -71,45 +75,135 @@ BEHAVIOUR_OPTIONS = [
 ]
 
 
+# Role names available for subordinate accounts. Admin is intentionally excluded.
+ASSIGNABLE_ROLES = ["Manager", "Bursar", "ICT Teacher", "Teacher"]
+
+MENU_DASHBOARD = "📊 Dashboard, Gender Totals & Filters"
+MENU_STAFF_ROLES = "👥 Manage Staff & Roles"
+MENU_TEACHER_DIRECTORY = "👨‍🏫 Teacher Registration & Directory"
+MENU_STUDENT_RECORDS = "📝 Student Registration & Edit"
+MENU_TIMETABLE = "👔 School Manager Profile & Timetable/Register"
+MENU_LESSONS = "📖 Daily/Weekly Lessons & Remaining Topics"
+MENU_ASSESSMENT = "🧮 Continuous Assessment & Score Entry"
+MENU_REPORTS = "📄 Terminal Report Cards (PDF Export)"
+MENU_CERTIFICATES = "🎓 Student Certificates & Term Honours"
+MENU_FINANCE = "💰 Fees, Teacher Salaries & Occasions/Incidents"
+MENU_ISSUE_REPORT = "📩 Report Issues to School Manager"
+MENU_ISSUE_MANAGEMENT = "📬 Teacher Issues & Manager Replies"
+MENU_EXPORT = "📥 CSV File Generator & Data Export"
+
+ALL_MENU_OPTIONS = [
+    MENU_DASHBOARD, MENU_STAFF_ROLES, MENU_TEACHER_DIRECTORY, MENU_STUDENT_RECORDS,
+    MENU_TIMETABLE, MENU_LESSONS, MENU_ASSESSMENT, MENU_REPORTS, MENU_CERTIFICATES,
+    MENU_FINANCE, MENU_ISSUE_REPORT, MENU_ISSUE_MANAGEMENT, MENU_EXPORT,
+]
+
+# Managers receive school-wide operational administration, but cannot manage
+# privileged user accounts. Other roles receive only position-related modules.
+ROLE_BASE_PERMISSIONS = {
+    "Admin": list(ALL_MENU_OPTIONS),
+    "Manager": [item for item in ALL_MENU_OPTIONS if item != MENU_STAFF_ROLES],
+    "Bursar": [MENU_DASHBOARD, MENU_FINANCE, MENU_EXPORT],
+    "ICT Teacher": [MENU_DASHBOARD, MENU_LESSONS, MENU_ASSESSMENT, MENU_REPORTS, MENU_CERTIFICATES, MENU_ISSUE_REPORT],
+    "Teacher": [MENU_DASHBOARD, MENU_LESSONS, MENU_ASSESSMENT, MENU_REPORTS, MENU_CERTIFICATES, MENU_ISSUE_REPORT],
+}
+
+# Admin-selected extras are deliberately restricted to work-related modules.
+# The Admin role and account-management module can never be granted here.
+ROLE_EXTRA_PRIVILEGES = {
+    "Manager": [],
+    "Bursar": [],
+    "ICT Teacher": [MENU_TEACHER_DIRECTORY, MENU_TIMETABLE, MENU_EXPORT],
+    "Teacher": [MENU_TIMETABLE, MENU_EXPORT],
+}
+
+
+def get_user_extra_permissions(conn, username: str):
+    rows = conn.execute(
+        "SELECT module_name FROM user_extra_permissions WHERE username = ? ORDER BY module_name",
+        (username,),
+    ).fetchall()
+    return [row["module_name"] for row in rows]
+
+
+def get_effective_permissions(conn, username: str, role: str):
+    base = list(ROLE_BASE_PERMISSIONS.get(role, []))
+    if role == "Admin":
+        return base
+    allowed_extras = set(ROLE_EXTRA_PRIVILEGES.get(role, []))
+    stored_extras = set(get_user_extra_permissions(conn, username))
+    return list(dict.fromkeys(base + [item for item in stored_extras if item in allowed_extras]))
+
+
+def write_audit_log(conn, username: str, role: str, action: str, details: str = ""):
+    conn.execute(
+        "INSERT INTO system_audit_log (username, role, action, details, created_at) VALUES (?, ?, ?, ?, ?)",
+        (username, role, action, details, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+
+
+def pdf_safe_text(value):
+    """Convert arbitrary user text to safe text for built-in FPDF core fonts."""
+    text_value = str(value if value is not None else "")
+    text_value = text_value.translate(str.maketrans({
+        "ɛ": "e", "Ɛ": "E", "ɔ": "o", "Ɔ": "O", "’": "'", "‘": "'",
+        "“": '"', "”": '"', "–": "-", "—": "-", "…": "...", "•": "-",
+    }))
+    normalized = unicodedata.normalize("NFKD", text_value)
+    return normalized.encode("latin-1", "replace").decode("latin-1")
+
+
+def pdf_output_bytes(pdf):
+    """Return PDF bytes consistently across supported PyFPDF / fpdf2 versions."""
+    output = pdf.output()
+    return output.encode("latin-1") if isinstance(output, str) else bytes(output)
+
+
 def create_db_backup(reason: str = "auto"):
-    """Creates a safe SQLite online backup snapshot so historical data is never lost."""
+    """Create a consistent SQLite online-backup snapshot without leaking connections."""
+    if not os.path.exists(DB_FILE) or os.path.getsize(DB_FILE) == 0:
+        return None
+
+    backup_dir = "db_backups"
+    os.makedirs(backup_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safe_reason = re.sub(r"[^A-Za-z0-9_-]+", "_", reason)[:30]
+    backup_path = os.path.join(backup_dir, f"globe_sms_backup_{timestamp}_{safe_reason}.db")
+    source_conn = destination_conn = None
     try:
-        if not os.path.exists(DB_FILE) or os.path.getsize(DB_FILE) == 0:
-            return None
-        backup_dir = "db_backups"
-        os.makedirs(backup_dir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_reason = re.sub(r"[^A-Za-z0-9_-]+", "_", reason)[:30]
-        bak_path = os.path.join(backup_dir, f"globe_sms_backup_{ts}_{safe_reason}.db")
-        src_conn = sqlite3.connect(DB_FILE)
-        dst_conn = sqlite3.connect(bak_path)
-        with dst_conn:
-            src_conn.backup(dst_conn)
-        dst_conn.close()
-        src_conn.close()
-        # Keep latest 25 backups to manage disk space cleanly
+        source_conn = sqlite3.connect(DB_FILE, timeout=30.0)
+        destination_conn = sqlite3.connect(backup_path, timeout=30.0)
+        source_conn.backup(destination_conn)
+        destination_conn.commit()
         backups = sorted(
-            [os.path.join(backup_dir, fn) for fn in os.listdir(backup_dir) if fn.endswith(".db")],
+            [os.path.join(backup_dir, name) for name in os.listdir(backup_dir) if name.endswith(".db")],
             key=os.path.getmtime,
         )
-        for old_bak in backups[:-25]:
+        for old_backup in backups[:-25]:
             try:
-                os.remove(old_bak)
+                os.remove(old_backup)
             except OSError:
                 pass
-        return bak_path
+        return backup_path
     except Exception:
+        try:
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
+        except OSError:
+            pass
         return None
+    finally:
+        if destination_conn is not None:
+            destination_conn.close()
+        if source_conn is not None:
+            source_conn.close()
 
 
 def _ensure_column(cursor, table_name: str, col_name: str, col_def: str):
-    """Safely adds a column to an existing table if it does not already exist."""
-    try:
-        cols = [r["name"] for r in cursor.execute(f"PRAGMA table_info({table_name})").fetchall()]
-        if col_name not in cols:
-            cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_def}")
-    except Exception:
-        pass
+    """Safely add a missing internal schema column; propagate unexpected DB errors."""
+    columns = [row["name"] for row in cursor.execute(f"PRAGMA table_info({table_name})").fetchall()]
+    if col_name not in columns:
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_def}")
 
 
 def get_connection():
@@ -126,7 +220,35 @@ def get_connection():
 
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Hash new passwords with salted PBKDF2-SHA256."""
+    iterations = 310000
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify modern hashes and transparently accept legacy SHA-256 hashes."""
+    if not stored_hash:
+        return False
+    if stored_hash.startswith("pbkdf2_sha256$"):
+        try:
+            algorithm, iteration_text, salt_hex, digest_hex = stored_hash.split("$", 3)
+            if algorithm != "pbkdf2_sha256":
+                return False
+            iterations = int(iteration_text)
+            if iterations < 100000 or iterations > 2000000:
+                return False
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(digest_hex)
+            actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+            return hmac.compare_digest(actual, expected)
+        except (ValueError, TypeError):
+            return False
+
+    # Compatibility path for accounts created by earlier GLOBE versions.
+    legacy_digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(legacy_digest, stored_hash)
 
 
 def capitalize_initials(name: str) -> str:
@@ -161,10 +283,10 @@ def save_teacher_class_assignments(conn, staff_id: str, class_levels: list):
 
 
 def get_teacher_assigned_classes(conn, username: str):
-    """Return assigned classes for a portal account; legacy accounts default safely to all."""
-    row = conn.execute("SELECT staff_id FROM teachers WHERE username = ?", (username,)).fetchone()
+    """Return only explicitly allocated classes, including recognized legacy all-class labels."""
+    row = conn.execute("SELECT staff_id FROM teachers WHERE username = ? AND TRIM(COALESCE(username, '')) != ''", (username,)).fetchone()
     if not row:
-        return list(CLASS_LEVELS)
+        return []
     rows = conn.execute(
         "SELECT class_level FROM teacher_class_assignments WHERE staff_id = ? ORDER BY assignment_id",
         (row["staff_id"],),
@@ -174,10 +296,11 @@ def get_teacher_assigned_classes(conn, username: str):
     # Compatibility fallback for a teacher profile created before the new table.
     legacy = conn.execute("SELECT assigned_class_level FROM teachers WHERE staff_id = ?", (row["staff_id"],)).fetchone()
     legacy_value = (legacy["assigned_class_level"] or "").strip() if legacy else ""
-    if not legacy_value or legacy_value == "All / Multiple Classes":
+    if legacy_value.lower() in ("all", "all classes", "all / multiple classes"):
         return list(CLASS_LEVELS)
-    parsed = [part.strip() for part in legacy_value.split(",") if part.strip() in CLASS_LEVELS]
-    return parsed or list(CLASS_LEVELS)
+    if not legacy_value:
+        return []
+    return [part.strip() for part in legacy_value.split(",") if part.strip() in CLASS_LEVELS]
 
 
 def generate_admission_number(surname: str, first_name: str, middle_name: str = "", seq_num: int = 1) -> str:
@@ -190,9 +313,22 @@ def generate_admission_number(surname: str, first_name: str, middle_name: str = 
     return f"GIS-{code_letters}-{year}-{seq_num:03d}"
 
 
+def generate_unique_admission_number(conn, surname: str, first_name: str, middle_name: str = "") -> str:
+    """Generate the next unused admission number, even if older records were deleted."""
+    next_seq = conn.execute("SELECT COUNT(*) FROM students").fetchone()[0] + 1
+    while True:
+        candidate = generate_admission_number(surname, first_name, middle_name, next_seq)
+        exists = conn.execute("SELECT 1 FROM students WHERE student_id = ?", (candidate,)).fetchone()
+        if not exists:
+            return candidate
+        next_seq += 1
+
+
 def init_db():
-    if os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > 0:
-        create_db_backup("startup")
+    if not st.session_state.get("_globe_startup_backup_done", False):
+        if os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > 0:
+            create_db_backup("startup")
+        st.session_state["_globe_startup_backup_done"] = True
     conn = get_connection()
     c = conn.cursor()
 
@@ -495,6 +631,13 @@ def init_db():
     c.execute("UPDATE students SET promotion_status = 'Promoted' WHERE promotion_status IS NULL OR TRIM(promotion_status) = ''")
     c.execute("UPDATE students SET student_edit_locked = 1 WHERE student_edit_locked IS NULL")
 
+    # Normalize legacy role labels so existing accounts retain the correct access.
+    c.execute("UPDATE users SET role = 'Bursar' WHERE LOWER(TRIM(role)) = 'bursary'")
+    c.execute("UPDATE users SET role = 'ICT Teacher' WHERE LOWER(TRIM(role)) IN ('ict', 'ict teacher')")
+    c.execute("UPDATE users SET role = 'Manager' WHERE LOWER(TRIM(role)) IN ('manager', 'school manager')")
+    c.execute("UPDATE users SET role = 'Teacher' WHERE LOWER(TRIM(role)) = 'teacher'")
+    c.execute("UPDATE users SET role = 'Admin' WHERE LOWER(TRIM(role)) = 'admin'")
+
     # One-time/idempotent migration: preserve existing teacher class allocations.
     legacy_teachers = c.execute(
         "SELECT staff_id, assigned_class_level FROM teachers WHERE assigned_class_level IS NOT NULL AND TRIM(assigned_class_level) != ''"
@@ -521,6 +664,30 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_students_teacher ON students(assigned_teacher_staff_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_fees_student ON fee_payments(student_id, term)")
 
+    # Position-based extra privileges and an audit trail for sensitive actions.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_extra_permissions (
+            username TEXT NOT NULL,
+            module_name TEXT NOT NULL,
+            granted_by TEXT NOT NULL,
+            granted_at TEXT NOT NULL,
+            PRIMARY KEY(username, module_name),
+            FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_user_extra_permissions_username ON user_extra_permissions(username)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS system_audit_log (
+            audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            role TEXT NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_system_audit_created ON system_audit_log(created_at)")
+
     conn.commit()
     conn.close()
 
@@ -529,7 +696,12 @@ def init_db():
 # 2. WASSCE GRADING & CLASH-FREE TIMETABLE ENGINE
 # ---------------------------------------------------------
 def calculate_wassce_grade(total_score: float):
-    score = round(total_score)
+    try:
+        score = round(float(total_score))
+    except (TypeError, ValueError, OverflowError):
+        return "F9", "Fail"
+    if not math.isfinite(float(score)) or score < 0 or score > 100:
+        return "F9", "Fail"
     if 80 <= score <= 100:
         return "A1", "Excellent"
     elif 70 <= score <= 79:
@@ -560,6 +732,13 @@ def compute_assessment(t1, t2, proj, exam_raw):
 
 
 def determine_term_honour(avg_score: float, min_pass_mark: float = 60.0):
+    try:
+        avg_score = float(avg_score)
+        min_pass_mark = float(min_pass_mark)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(avg_score) or not math.isfinite(min_pass_mark):
+        return None
     if avg_score < min_pass_mark:
         return None
     if avg_score >= 85.0:
@@ -573,76 +752,102 @@ def determine_term_honour(avg_score: float, min_pass_mark: float = 60.0):
 
 
 def generate_clash_free_timetable(conn, target_class: str, days: list, time_slots: list, chosen_subjects: list, mode_used: str, created_by: str):
-    c = conn.cursor()
+    """Create a clash-free timetable using only teachers assigned to the class and subject."""
+    if target_class not in CLASS_LEVELS:
+        raise ValueError("A valid class level must be selected before generating a timetable.")
 
-    c.execute("SELECT staff_id, full_name, assigned_subject, assigned_class_level FROM teachers WHERE status = 'Active'")
-    active_teachers = [dict(r) for r in c.fetchall()]
+    cursor = conn.cursor()
+    active_teachers = [dict(row) for row in cursor.execute(
+        "SELECT staff_id, full_name, assigned_subject, assigned_class_level FROM teachers WHERE status = 'Active'"
+    ).fetchall()]
     for teacher in active_teachers:
-        c.execute(
+        assigned_rows = cursor.execute(
             "SELECT class_level FROM teacher_class_assignments WHERE staff_id = ?",
             (teacher["staff_id"],),
-        )
-        allocated = {row["class_level"] for row in c.fetchall()}
+        ).fetchall()
+        allocated = {row["class_level"] for row in assigned_rows if row["class_level"] in CLASS_LEVELS}
         if not allocated:
             legacy_value = (teacher.get("assigned_class_level") or "").strip()
-            allocated = set(CLASS_LEVELS) if legacy_value.lower() in ("all", "all classes", "multiple classes") else {x.strip() for x in legacy_value.split(",") if x.strip()}
-        teacher["allocated_classes"] = allocated or set(CLASS_LEVELS)
+            if legacy_value.lower() in ("all", "all classes", "all / multiple classes"):
+                allocated = set(CLASS_LEVELS)
+            else:
+                allocated = {part.strip() for part in legacy_value.split(",") if part.strip() in CLASS_LEVELS}
+        teacher["allocated_classes"] = allocated
 
-    c.execute("SELECT day_of_week, time_slot, teacher_name FROM school_timetable WHERE class_level != ?", (target_class,))
-    booked_slots = {(r["day_of_week"], r["time_slot"], r["teacher_name"]) for r in c.fetchall()}
+    booked_slots = {
+        (row["day_of_week"], row["time_slot"], row["teacher_name"])
+        for row in cursor.execute(
+            "SELECT day_of_week, time_slot, teacher_name FROM school_timetable WHERE class_level != ?",
+            (target_class,),
+        ).fetchall()
+    }
 
-    c.execute("DELETE FROM school_timetable WHERE class_level = ?", (target_class,))
+    subject_pool = list(dict.fromkeys(subject for subject in (chosen_subjects or []) if subject in SUBJECTS_LIST))
+    if not subject_pool:
+        subject_pool = SUBJECTS_LIST[:5]
 
-    subject_pool = chosen_subjects if chosen_subjects else SUBJECTS_LIST[:5]
-    sub_idx = 0
-    inserted_count = 0
+    subject_index = 0
     conflicts_skipped = 0
+    scheduled_rows = []
 
     for day in days:
         used_subjects_today = set()
         for slot in time_slots:
             assigned_teacher_name = None
-            assigned_sub = None
+            assigned_subject = None
+            eligible_teachers = [
+                teacher for teacher in active_teachers
+                if target_class in teacher["allocated_classes"]
+            ]
 
             for attempt in range(len(subject_pool)):
-                candidate_sub = subject_pool[(sub_idx + attempt) % len(subject_pool)]
-                if candidate_sub in used_subjects_today and len(subject_pool) > len(time_slots):
+                candidate_subject = subject_pool[(subject_index + attempt) % len(subject_pool)]
+                if candidate_subject in used_subjects_today:
                     continue
 
-                eligible_teachers = [t for t in active_teachers if target_class in t["allocated_classes"]]
-                matching_teachers = [t["full_name"] for t in eligible_teachers if t["assigned_subject"] == candidate_sub]
-                other_teachers = [t["full_name"] for t in eligible_teachers if t["full_name"] not in matching_teachers]
-                ordered_candidates = matching_teachers + other_teachers
-
-                for t_name in ordered_candidates:
-                    if (day, slot, t_name) not in booked_slots:
-                        assigned_teacher_name = t_name
-                        assigned_sub = candidate_sub
-                        booked_slots.add((day, slot, t_name))
-                        used_subjects_today.add(candidate_sub)
-                        sub_idx = (sub_idx + attempt + 1) % len(subject_pool)
+                matching_teachers = [
+                    teacher["full_name"] for teacher in eligible_teachers
+                    if teacher.get("assigned_subject") == candidate_subject
+                ]
+                for teacher_name in matching_teachers:
+                    if (day, slot, teacher_name) not in booked_slots:
+                        assigned_teacher_name = teacher_name
+                        assigned_subject = candidate_subject
+                        booked_slots.add((day, slot, teacher_name))
+                        used_subjects_today.add(candidate_subject)
+                        subject_index = (subject_index + attempt + 1) % len(subject_pool)
                         break
-
                 if assigned_teacher_name:
                     break
 
             if not assigned_teacher_name:
-                # Do not invent a placeholder teacher or assign a teacher outside
-                # their registered class allocation. Leave this slot unscheduled.
                 conflicts_skipped += 1
                 continue
 
-            c.execute(
-                """
-                INSERT INTO school_timetable (class_level, day_of_week, time_slot, subject, teacher_name, mode_used, created_by)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (target_class, day, slot, assigned_sub, assigned_teacher_name, mode_used, created_by),
-            )
-            inserted_count += 1
+            scheduled_rows.append((
+                target_class, day, slot, assigned_subject, assigned_teacher_name, mode_used, created_by
+            ))
 
-    conn.commit()
-    return inserted_count, conflicts_skipped
+    # Do not erase a previously saved timetable when there is no valid replacement.
+    if scheduled_rows:
+        cursor.execute("SAVEPOINT timetable_replace")
+        try:
+            cursor.execute("DELETE FROM school_timetable WHERE class_level = ?", (target_class,))
+            cursor.executemany(
+                """INSERT INTO school_timetable
+                   (class_level, day_of_week, time_slot, subject, teacher_name, mode_used, created_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                scheduled_rows,
+            )
+            cursor.execute("RELEASE SAVEPOINT timetable_replace")
+            conn.commit()
+        except Exception:
+            cursor.execute("ROLLBACK TO SAVEPOINT timetable_replace")
+            cursor.execute("RELEASE SAVEPOINT timetable_replace")
+            conn.rollback()
+            raise
+
+    return len(scheduled_rows), conflicts_skipped
 
 
 # ---------------------------------------------------------
@@ -652,12 +857,12 @@ class SchoolPDF(FPDF):
     def header(self):
         self.set_font("Arial", "B", 15)
         self.set_text_color(27, 54, 93)
-        self.cell(0, 8, SCHOOL_NAME, ln=True, align="C")
+        self.cell(0, 8, pdf_safe_text(SCHOOL_NAME), ln=True, align="C")
         self.set_font("Arial", "B", 9)
         self.set_text_color(80, 80, 80)
-        self.cell(0, 5, SCHOOL_LOCATION, ln=True, align="C")
+        self.cell(0, 5, pdf_safe_text(SCHOOL_LOCATION), ln=True, align="C")
         self.set_font("Arial", "I", 9)
-        self.cell(0, 5, f'Motto: "{SCHOOL_MOTTO}"', ln=True, align="C")
+        self.cell(0, 5, pdf_safe_text(f'Motto: "{SCHOOL_MOTTO}"'), ln=True, align="C")
         self.ln(3)
         self.set_draw_color(27, 54, 93)
         self.set_line_width(0.6)
@@ -693,17 +898,25 @@ def _render_single_report_page(pdf, student_info, term, report_df, overall_total
         try:
             fd, temp_img_path = tempfile.mkstemp(suffix=ext)
             with os.fdopen(fd, "wb") as tmp_f:
-                tmp_f.write(photo_bytes)
+                tmp_f.write(bytes(photo_bytes))
             pdf.set_draw_color(27, 54, 93)
             pdf.set_line_width(0.6)
             pdf.rect(168, 36, 26, 29)
             pdf.image(temp_img_path, x=169, y=37, w=24, h=27)
         except Exception:
+            pdf.set_draw_color(180, 190, 205)
+            pdf.rect(168, 36, 26, 29)
+        finally:
+            if temp_img_path and os.path.exists(temp_img_path):
+                try:
+                    os.remove(temp_img_path)
+                except OSError:
+                    pass
             temp_img_path = None
 
     pdf.set_font("Arial", "B", 12)
     pdf.set_fill_color(230, 238, 248)
-    pdf.cell(152, 8, f"STUDENT TERMINAL REPORT CARD - {term.upper()}", ln=True, align="C", fill=True)
+    pdf.cell(152, 8, pdf_safe_text(f"STUDENT TERMINAL REPORT CARD - {term.upper()}"), ln=True, align="C", fill=True)
     pdf.ln(3)
 
     promo_val = ""
@@ -715,27 +928,27 @@ def _render_single_report_page(pdf, student_info, term, report_df, overall_total
     pdf.set_font("Arial", "B", 9.5)
     pdf.cell(34, 6.5, "Student Name:", border=0)
     pdf.set_font("Arial", "", 9.5)
-    pdf.cell(58, 6.5, str(student_info["full_name"]), border=0)
+    pdf.cell(58, 6.5, pdf_safe_text(student_info["full_name"]), border=0)
 
     pdf.set_font("Arial", "B", 9.5)
     pdf.cell(30, 6.5, "Admission No.:", border=0)
     pdf.set_font("Arial", "", 9.5)
-    pdf.cell(35, 6.5, str(student_info["student_id"]), ln=True)
+    pdf.cell(35, 6.5, pdf_safe_text(student_info["student_id"]), ln=True)
 
     pdf.set_font("Arial", "B", 9.5)
     pdf.cell(34, 6.5, "Class / Grade:", border=0)
     pdf.set_font("Arial", "", 9.5)
-    pdf.cell(58, 6.5, str(student_info["class_level"]), border=0)
+    pdf.cell(58, 6.5, pdf_safe_text(student_info["class_level"]), border=0)
 
     pdf.set_font("Arial", "B", 9.5)
     pdf.cell(30, 6.5, "Status:", border=0)
     pdf.set_font("Arial", "B", 9.5)
-    pdf.cell(35, 6.5, str(promo_val), ln=True)
+    pdf.cell(35, 6.5, pdf_safe_text(promo_val), ln=True)
 
     pdf.set_font("Arial", "B", 9.5)
     pdf.cell(34, 6.5, "Program:", border=0)
     pdf.set_font("Arial", "", 9.5)
-    pdf.cell(58, 6.5, str(student_info["program"]), border=0)
+    pdf.cell(58, 6.5, pdf_safe_text(student_info["program"]), border=0)
 
     pdf.set_font("Arial", "B", 9.5)
     pdf.cell(30, 6.5, "Overall Average:", border=0)
@@ -745,12 +958,12 @@ def _render_single_report_page(pdf, student_info, term, report_df, overall_total
     pdf.set_font("Arial", "B", 9.5)
     pdf.cell(34, 6.5, "Residential:", border=0)
     pdf.set_font("Arial", "", 9.5)
-    pdf.cell(58, 6.5, str(student_info["boarding_status"]), border=0)
+    pdf.cell(58, 6.5, pdf_safe_text(student_info["boarding_status"]), border=0)
 
     pdf.set_font("Arial", "B", 9.5)
     pdf.cell(30, 6.5, "Behaviour:", border=0)
     pdf.set_font("Arial", "B", 9.5)
-    pdf.cell(35, 6.5, str(behaviour_label or "Exemplary Conduct & Respect"), ln=True)
+    pdf.cell(35, 6.5, pdf_safe_text(behaviour_label or "Exemplary Conduct & Respect"), ln=True)
     pdf.ln(5)
 
 
@@ -772,12 +985,12 @@ def generate_terminal_report_pdf(student_info, term, report_df, overall_total, o
     pdf.set_font("Arial", "", 9)
     pdf.set_text_color(0, 0, 0)
     for _, row in report_df.iterrows():
-        pdf.cell(col_widths[0], 7, str(row["Subject"]), border=1)
+        pdf.cell(col_widths[0], 7, pdf_safe_text(row["Subject"]), border=1)
         pdf.cell(col_widths[1], 7, f"{row['SBA (30%)']}", border=1, align="C")
         pdf.cell(col_widths[2], 7, f"{row['Exam (70%)']}", border=1, align="C")
         pdf.cell(col_widths[3], 7, f"{row['Total (100%)']}", border=1, align="C")
-        pdf.cell(col_widths[4], 7, str(row["Grade"]), border=1, align="C")
-        pdf.cell(col_widths[5], 7, str(row["Remark"]), border=1, align="C")
+        pdf.cell(col_widths[4], 7, pdf_safe_text(row["Grade"]), border=1, align="C")
+        pdf.cell(col_widths[5], 7, pdf_safe_text(row["Remark"]), border=1, align="C")
         pdf.ln()
 
     pdf.ln(5)
@@ -788,14 +1001,14 @@ def generate_terminal_report_pdf(student_info, term, report_df, overall_total, o
     pdf.set_font("Arial", "B", 10)
     pdf.cell(0, 6, "Form Master's Remark:", ln=True)
     pdf.set_font("Arial", "I", 10)
-    pdf.multi_cell(0, 6, master_comment)
+    pdf.multi_cell(0, 6, pdf_safe_text(master_comment))
     pdf.ln(3)
 
     if approval_info is not None:
         pdf.set_font("Arial", "B", 10)
-        pdf.cell(0, 6, f"School Manager Sign-Off ({approval_info['manager_role']} - {approval_info['approved_by']}):", ln=True)
+        pdf.cell(0, 6, pdf_safe_text(f"School Manager Sign-Off ({approval_info['manager_role']} - {approval_info['approved_by']}):"), ln=True)
         pdf.set_font("Arial", "I", 10)
-        pdf.multi_cell(0, 6, f"{approval_info['management_remark']} (Signed on {approval_info['signed_date']})")
+        pdf.multi_cell(0, 6, pdf_safe_text(f"{approval_info['management_remark']} (Signed on {approval_info['signed_date']})"))
         pdf.ln(4)
 
     pdf.ln(6)
@@ -805,7 +1018,7 @@ def generate_terminal_report_pdf(student_info, term, report_df, overall_total, o
     pdf.cell(95, 5, "Class Teacher's Signature", align="C")
     pdf.cell(95, 5, "School Manager Signature", align="C", ln=True)
 
-    return bytes(pdf.output())
+    return pdf_output_bytes(pdf)
 
 
 def generate_class_report_cards_pdf(class_records):
@@ -835,12 +1048,12 @@ def generate_class_report_cards_pdf(class_records):
         pdf.set_font("Arial", "", 9)
         pdf.set_text_color(0, 0, 0)
         for _, row in item["report_df"].iterrows():
-            pdf.cell(col_widths[0], 7, str(row["Subject"]), border=1)
+            pdf.cell(col_widths[0], 7, pdf_safe_text(row["Subject"]), border=1)
             pdf.cell(col_widths[1], 7, f"{row['SBA (30%)']}", border=1, align="C")
             pdf.cell(col_widths[2], 7, f"{row['Exam (70%)']}", border=1, align="C")
             pdf.cell(col_widths[3], 7, f"{row['Total (100%)']}", border=1, align="C")
-            pdf.cell(col_widths[4], 7, str(row["Grade"]), border=1, align="C")
-            pdf.cell(col_widths[5], 7, str(row["Remark"]), border=1, align="C")
+            pdf.cell(col_widths[4], 7, pdf_safe_text(row["Grade"]), border=1, align="C")
+            pdf.cell(col_widths[5], 7, pdf_safe_text(row["Remark"]), border=1, align="C")
             pdf.ln()
 
         pdf.ln(5)
@@ -851,14 +1064,14 @@ def generate_class_report_cards_pdf(class_records):
         pdf.set_font("Arial", "B", 10)
         pdf.cell(0, 6, "Form Master's Remark:", ln=True)
         pdf.set_font("Arial", "I", 10)
-        pdf.multi_cell(0, 6, item["master_comment"])
+        pdf.multi_cell(0, 6, pdf_safe_text(item["master_comment"]))
         pdf.ln(3)
 
         if item.get("approval_info") is not None:
             pdf.set_font("Arial", "B", 10)
-            pdf.cell(0, 6, f"School Manager Sign-Off ({item['approval_info']['manager_role']} - {item['approval_info']['approved_by']}):", ln=True)
+            pdf.cell(0, 6, pdf_safe_text(f"School Manager Sign-Off ({item['approval_info']['manager_role']} - {item['approval_info']['approved_by']}):"), ln=True)
             pdf.set_font("Arial", "I", 10)
-            pdf.multi_cell(0, 6, f"{item['approval_info']['management_remark']} (Signed on {item['approval_info']['signed_date']})")
+            pdf.multi_cell(0, 6, pdf_safe_text(f"{item['approval_info']['management_remark']} (Signed on {item['approval_info']['signed_date']})"))
             pdf.ln(4)
 
         pdf.ln(6)
@@ -868,7 +1081,7 @@ def generate_class_report_cards_pdf(class_records):
         pdf.cell(95, 5, "Class Teacher's Signature", align="C")
         pdf.cell(95, 5, "School Manager Signature", align="C", ln=True)
 
-    return bytes(pdf.output())
+    return pdf_output_bytes(pdf)
 
 
 def generate_student_certificate_pdf(
@@ -880,129 +1093,160 @@ def generate_student_certificate_pdf(
     issued_date: str,
     manager_name: str,
 ):
-    """Generates a landscape A4 certificate with decorative gold/navy borders and student passport photo."""
+    """Build a landscape A4 certificate; safely handles missing photos and Unicode input."""
+    required = ("student_id", "full_name", "class_level", "program")
+    missing = [key for key in required if not student_info.get(key)]
+    if missing:
+        raise ValueError("Missing student certificate details: " + ", ".join(missing))
+
     pdf = FPDF(orientation="L", unit="mm", format="A4")
-    pdf.add_page()
+    pdf.set_margins(15, 15, 15)
     pdf.set_auto_page_break(auto=False)
-
-    # Outer Navy Frame & Inner Gold Double Border
-    pdf.set_draw_color(27, 54, 93)
-    pdf.set_line_width(2.2)
-    pdf.rect(8, 8, 281, 194)
-
-    pdf.set_draw_color(212, 160, 23)
-    pdf.set_line_width(0.9)
-    pdf.rect(12, 12, 273, 186)
-
-    # Subtle header ribbon
-    pdf.set_fill_color(244, 247, 251)
-    pdf.rect(14, 14, 269, 34, style="F")
-
-    # School Name & Motto
-    pdf.set_xy(15, 17)
-    pdf.set_font("Arial", "B", 20)
-    pdf.set_text_color(27, 54, 93)
-    pdf.cell(0, 9, SCHOOL_NAME, ln=True, align="C")
-
-    pdf.set_font("Arial", "B", 9)
-    pdf.set_text_color(90, 90, 90)
-    pdf.cell(0, 5, SCHOOL_LOCATION, ln=True, align="C")
-
-    pdf.set_font("Arial", "I", 10)
-    pdf.set_text_color(160, 118, 10)
-    pdf.cell(0, 6, f'"{SCHOOL_MOTTO}"', ln=True, align="C")
-
-    # Student Passport Picture on Top-Right if available
+    pdf.add_page()
     temp_img_path = None
-    photo_bytes = student_info.get("passport_photo")
-    if photo_bytes:
-        mime = (student_info.get("passport_mime") or "").lower()
-        ext = ".png" if "png" in mime else ".jpg"
-        try:
-            fd, temp_img_path = tempfile.mkstemp(suffix=ext)
-            with os.fdopen(fd, "wb") as tmp_f:
-                tmp_f.write(photo_bytes)
-            pdf.set_draw_color(212, 160, 23)
-            pdf.set_line_width(0.8)
+    try:
+        pdf.set_draw_color(27, 54, 93)
+        pdf.set_line_width(2.2)
+        pdf.rect(8, 8, 281, 194)
+        pdf.set_draw_color(212, 160, 23)
+        pdf.set_line_width(0.9)
+        pdf.rect(12, 12, 273, 186)
+        pdf.set_fill_color(244, 247, 251)
+        pdf.rect(14, 14, 269, 34, style="F")
+
+        pdf.set_xy(18, 17)
+        pdf.set_font("Arial", "B", 19)
+        pdf.set_text_color(27, 54, 93)
+        pdf.cell(261, 8, pdf_safe_text(SCHOOL_NAME), ln=True, align="C")
+        pdf.set_font("Arial", "B", 8)
+        pdf.set_text_color(90, 90, 90)
+        pdf.cell(261, 5, pdf_safe_text(SCHOOL_LOCATION), ln=True, align="C")
+        pdf.set_font("Arial", "I", 9)
+        pdf.set_text_color(160, 118, 10)
+        pdf.cell(261, 5, pdf_safe_text(f'"{SCHOOL_MOTTO}"'), ln=True, align="C")
+
+        # A failed/unsupported image must never prevent the certificate from rendering.
+        photo_bytes = student_info.get("passport_photo")
+        if photo_bytes:
+            mime = (student_info.get("passport_mime") or "").lower()
+            ext = ".png" if "png" in mime else ".jpg"
+            try:
+                fd, temp_img_path = tempfile.mkstemp(suffix=ext)
+                with os.fdopen(fd, "wb") as tmp_f:
+                    tmp_f.write(bytes(photo_bytes))
+                pdf.set_draw_color(212, 160, 23)
+                pdf.set_line_width(0.8)
+                pdf.rect(244, 52, 34, 38)
+                pdf.image(temp_img_path, x=245, y=53, w=32, h=36)
+            except Exception:
+                if temp_img_path and os.path.exists(temp_img_path):
+                    os.remove(temp_img_path)
+                temp_img_path = None
+                pdf.set_draw_color(180, 190, 205)
+                pdf.rect(244, 52, 34, 38)
+                pdf.set_xy(244, 68)
+                pdf.set_font("Arial", "I", 8)
+                pdf.set_text_color(130, 130, 130)
+                pdf.cell(34, 5, "Photo unavailable", align="C")
+        else:
+            pdf.set_draw_color(180, 190, 205)
+            pdf.set_line_width(0.5)
             pdf.rect(244, 52, 34, 38)
-            pdf.image(temp_img_path, x=245, y=53, w=32, h=36)
-        except Exception:
-            temp_img_path = None
-    else:
-        pdf.set_draw_color(180, 190, 205)
-        pdf.set_line_width(0.5)
-        pdf.rect(244, 52, 34, 38)
-        pdf.set_xy(244, 68)
-        pdf.set_font("Arial", "I", 8)
-        pdf.set_text_color(130, 130, 130)
-        pdf.cell(34, 5, "Passport Photo", align="C")
+            pdf.set_xy(244, 68)
+            pdf.set_font("Arial", "I", 8)
+            pdf.set_text_color(130, 130, 130)
+            pdf.cell(34, 5, "Passport Photo", align="C")
 
-    # Certificate Title
-    pdf.set_xy(15, 54)
-    pdf.set_font("Arial", "B", 22)
-    pdf.set_text_color(27, 54, 93)
-    pdf.cell(0, 11, cert_title.upper(), ln=True, align="C")
+        pdf.set_xy(18, 53)
+        pdf.set_font("Arial", "B", 20)
+        pdf.set_text_color(27, 54, 93)
+        title_text = pdf_safe_text(cert_title).upper()
+        while pdf.get_string_width(title_text) > 210 and pdf.font_size_pt > 12:
+            pdf.set_font_size(pdf.font_size_pt - 1)
+        pdf.cell(225, 10, title_text, ln=True, align="C")
 
-    pdf.set_font("Arial", "B", 11)
-    pdf.set_text_color(180, 130, 15)
-    pdf.cell(0, 6, subtitle, ln=True, align="C")
+        pdf.set_xy(18, 65)
+        pdf.set_font("Arial", "B", 10)
+        pdf.set_text_color(180, 130, 15)
+        subtitle_text = pdf_safe_text(subtitle)
+        while pdf.get_string_width(subtitle_text) > 210 and pdf.font_size_pt > 8:
+            pdf.set_font_size(pdf.font_size_pt - 0.5)
+        pdf.cell(225, 6, subtitle_text, ln=True, align="C")
 
-    pdf.ln(5)
-    pdf.set_font("Arial", "", 12)
-    pdf.set_text_color(50, 50, 50)
-    pdf.cell(0, 7, "This is to proudly certify that", ln=True, align="C")
+        pdf.set_xy(20, 77)
+        pdf.set_font("Arial", "", 11)
+        pdf.set_text_color(50, 50, 50)
+        pdf.cell(257, 7, "This is to proudly certify that", ln=True, align="C")
 
-    # Student Full Name
-    pdf.ln(2)
-    pdf.set_font("Arial", "B", 21)
-    pdf.set_text_color(15, 35, 66)
-    pdf.cell(0, 11, str(student_info["full_name"]).upper(), ln=True, align="C")
+        student_name = pdf_safe_text(student_info["full_name"]).upper()
+        pdf.set_xy(20, 91)
+        pdf.set_font("Arial", "B", 21)
+        pdf.set_text_color(15, 35, 66)
+        while pdf.get_string_width(student_name) > 235 and pdf.font_size_pt > 12:
+            pdf.set_font_size(pdf.font_size_pt - 1)
+        pdf.cell(257, 11, student_name, ln=True, align="C")
 
-    # Gold underline under student name
-    pdf.set_draw_color(212, 160, 23)
-    pdf.set_line_width(0.7)
-    pdf.line(78, pdf.get_y() + 1, 219, pdf.get_y() + 1)
-    pdf.ln(4)
+        pdf.set_draw_color(212, 160, 23)
+        pdf.set_line_width(0.7)
+        pdf.line(78, 104, 219, 104)
+        pdf.set_xy(20, 107)
+        pdf.set_font("Arial", "B", 9)
+        pdf.set_text_color(70, 85, 105)
+        detail_line = (
+            f"Admission No.: {student_info['student_id']}   |   "
+            f"Class / Grade: {student_info['class_level']}   |   "
+            f"Programme: {student_info['program']}"
+        )
+        detail_text = pdf_safe_text(detail_line)
+        while pdf.get_string_width(detail_text) > 250 and pdf.font_size_pt > 7:
+            pdf.set_font_size(pdf.font_size_pt - 0.5)
+        pdf.cell(257, 6, detail_text, ln=True, align="C")
 
-    pdf.set_font("Arial", "B", 10)
-    pdf.set_text_color(70, 85, 105)
-    pdf.cell(
-        0,
-        6,
-        f"Admission No.: {student_info['student_id']}   |   Class / Grade: {student_info['class_level']}   |   Programme: {student_info['program']}",
-        ln=True,
-        align="C",
-    )
+        # Wrap and cap the citation so it cannot overlap the signature footer.
+        citation = pdf_safe_text(citation_text).replace("\r", " ").replace("\n", " ")
+        pdf.set_font("Arial", "", 10)
+        max_width = 225
+        words = citation.split()
+        lines, current = [], ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if current and pdf.get_string_width(candidate) > max_width:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        if len(lines) > 5:
+            lines = lines[:5]
+            last = lines[-1]
+            while last and pdf.get_string_width(last + "...") > max_width:
+                last = last.rsplit(" ", 1)[0] if " " in last else ""
+            lines[-1] = (last + "...").strip()
+        pdf.set_xy(32, 118)
+        pdf.multi_cell(233, 5.5, "\n".join(lines), align="C")
 
-    pdf.ln(4)
-    pdf.set_xy(32, pdf.get_y())
-    pdf.set_font("Arial", "", 11.5)
-    pdf.set_text_color(30, 30, 30)
-    pdf.multi_cell(233, 6.5, citation_text, align="C")
+        pdf.set_xy(22, 165)
+        pdf.set_font("Arial", "B", 9)
+        pdf.set_text_color(27, 54, 93)
+        pdf.cell(80, 6, "____________________________", align="C")
+        pdf.cell(93, 6, pdf_safe_text(f"Certificate No: {cert_no}"), align="C")
+        pdf.cell(80, 6, "____________________________", align="C", ln=True)
+        pdf.set_x(22)
+        pdf.set_font("Arial", "B", 8.5)
+        pdf.cell(80, 5, "Class Teacher / Academic Head", align="C")
+        pdf.set_font("Arial", "I", 8.5)
+        pdf.cell(93, 5, pdf_safe_text(f"Issued on: {issued_date}"), align="C")
+        pdf.set_font("Arial", "B", 8.5)
+        pdf.cell(80, 5, pdf_safe_text(f"{manager_name} (School Manager)"), align="C", ln=True)
 
-    # Footer Signatures & Certificate ID
-    pdf.set_xy(22, 165)
-    pdf.set_font("Arial", "B", 10)
-    pdf.set_text_color(27, 54, 93)
-    pdf.cell(80, 6, "____________________________", align="C")
-    pdf.cell(93, 6, f"Certificate No: {cert_no}", align="C")
-    pdf.cell(80, 6, "____________________________", align="C", ln=True)
-
-    pdf.set_x(22)
-    pdf.set_font("Arial", "B", 9.5)
-    pdf.cell(80, 5, "Class Teacher / Academic Head", align="C")
-    pdf.set_font("Arial", "I", 9.5)
-    pdf.cell(93, 5, f"Issued on: {issued_date}", align="C")
-    pdf.set_font("Arial", "B", 9.5)
-    pdf.cell(80, 5, f"{manager_name} (School Manager)", align="C", ln=True)
-
-    pdf_out = bytes(pdf.output())
-    if temp_img_path and os.path.exists(temp_img_path):
-        try:
-            os.remove(temp_img_path)
-        except OSError:
-            pass
-    return pdf_out
+        return pdf_output_bytes(pdf)
+    finally:
+        if temp_img_path and os.path.exists(temp_img_path):
+            try:
+                os.remove(temp_img_path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------
@@ -1186,12 +1430,19 @@ if st.session_state.user is None:
                 conn = get_connection()
                 c = conn.cursor()
                 c.execute(
-                    "SELECT username, full_name, role, assigned_subject, passport_photo FROM users WHERE username = ? AND password_hash = ?",
-                    (username.strip(), hash_password(password)),
+                    "SELECT username, password_hash, full_name, role, assigned_subject, passport_photo FROM users WHERE username = ?",
+                    (username.strip(),),
                 )
                 user_row = c.fetchone()
-                conn.close()
-                if user_row:
+                if user_row and verify_password(password, user_row["password_hash"]):
+                    # Upgrade older unsalted hashes only after a successful login.
+                    if not user_row["password_hash"].startswith("pbkdf2_sha256$"):
+                        c.execute(
+                            "UPDATE users SET password_hash = ? WHERE username = ?",
+                            (hash_password(password), user_row["username"]),
+                        )
+                        conn.commit()
+                    conn.close()
                     st.session_state.user = {
                         "username": user_row["username"],
                         "full_name": user_row["full_name"],
@@ -1201,6 +1452,7 @@ if st.session_state.user is None:
                     }
                     st.rerun()
                 else:
+                    conn.close()
                     st.error("Invalid username or password.")
 
         with st.expander("ℹ️ Sign-In Guidance"):
@@ -1209,8 +1461,22 @@ if st.session_state.user is None:
             )
     st.stop()
 
-# Logged-in User Sidebar
+# Logged-in account is refreshed on every rerun so role changes take effect immediately.
 user = st.session_state.user
+_auth_conn = get_connection()
+_auth_row = _auth_conn.execute(
+    "SELECT username, full_name, role, assigned_subject, passport_photo FROM users WHERE username = ?",
+    (user.get("username"),),
+).fetchone()
+if not _auth_row:
+    _auth_conn.close()
+    st.session_state.user = None
+    st.error("This account is no longer available. Please sign in again.")
+    st.stop()
+user = dict(_auth_row)
+st.session_state.user = user
+nav_options = get_effective_permissions(_auth_conn, user["username"], user["role"])
+_auth_conn.close()
 if user.get("passport_photo"):
     st.sidebar.image(user["passport_photo"], caption=f"{user['full_name']} ({user['role']})", width=120)
 st.sidebar.success(f"👤 **{user['full_name']}**\n\nRole: `{user['role']}`")
@@ -1218,39 +1484,42 @@ if st.sidebar.button("Logout"):
     st.session_state.user = None
     st.rerun()
 
-# Role-based Navigation
-if user["role"] in ["Admin", "Manager"]:
-    nav_options = [
-        "📊 Dashboard, Gender Totals & Filters",
-        "👥 Manage Staff & Roles",
-        "👨‍🏫 Teacher Registration & Directory",
-        "📝 Student Registration & Edit",
-        "👔 School Manager Profile & Timetable/Register",
-        "🧮 Continuous Assessment & Score Entry",
-        "📄 Terminal Report Cards (PDF Export)",
-        "🎓 Student Certificates & Term Honours",
-        "💰 Fees, Teacher Salaries & Occasions/Incidents",
-        "📬 Teacher Issues & Manager Replies",
-        "📥 CSV File Generator & Data Export",
-    ]
-elif user["role"] == "Teacher":
-    nav_options = [
-        "📊 Dashboard, Gender Totals & Filters",
-        "📖 Daily/Weekly Lessons & Remaining Topics",
-        "🧮 Continuous Assessment & Score Entry",
-        "📄 Terminal Report Cards (PDF Export)",
-        "🎓 Student Certificates & Term Honours",
-        "📩 Report Issues to School Manager",
-        "📥 CSV File Generator & Data Export",
-    ]
-else:  # Bursar
-    nav_options = [
-        "📊 Dashboard, Gender Totals & Filters",
-        "💰 Fees, Teacher Salaries & Occasions/Incidents",
-        "📥 CSV File Generator & Data Export",
-    ]
+with st.sidebar.expander("🔐 Change My Password"):
+    with st.sidebar.form(f"change_password_form_{user['username']}"):
+        current_password = st.sidebar.text_input("Current Password", type="password", key=f"current_password_{user['username']}")
+        new_password = st.sidebar.text_input("New Password (10+ characters)", type="password", key=f"new_password_{user['username']}")
+        confirm_new_password = st.sidebar.text_input("Confirm New Password", type="password", key=f"confirm_password_{user['username']}")
+        change_password_clicked = st.sidebar.form_submit_button("Update My Password")
+        if change_password_clicked:
+            password_conn = get_connection()
+            stored_row = password_conn.execute(
+                "SELECT password_hash FROM users WHERE username = ?", (user["username"],)
+            ).fetchone()
+            if not stored_row or not verify_password(current_password, stored_row["password_hash"]):
+                st.sidebar.error("The current password is incorrect.")
+            elif len(new_password) < 10:
+                st.sidebar.error("New password must contain at least 10 characters.")
+            elif new_password != confirm_new_password:
+                st.sidebar.error("The new password and confirmation do not match.")
+            elif new_password == current_password:
+                st.sidebar.error("Choose a new password different from your current password.")
+            else:
+                password_conn.execute(
+                    "UPDATE users SET password_hash = ? WHERE username = ?",
+                    (hash_password(new_password), user["username"]),
+                )
+                write_audit_log(password_conn, user["username"], user["role"], "Password changed", "Account owner changed their password")
+                password_conn.commit()
+                st.sidebar.success("Your password has been updated securely.")
+            password_conn.close()
 
+if not nav_options:
+    st.error("No modules are assigned to this account. Please contact the system administrator.")
+    st.stop()
 menu = st.sidebar.radio("System Modules", nav_options)
+if menu not in nav_options:
+    st.error("You do not have permission to open this module.")
+    st.stop()
 _focus_next_field_js()
 
 
@@ -1271,6 +1540,20 @@ if menu == "📊 Dashboard, Gender Totals & Filters":
     df_fees = pd.read_sql_query("SELECT * FROM fee_payments", conn)
     df_occasions = pd.read_sql_query("SELECT * FROM special_occasions ORDER BY created_at DESC LIMIT 5", conn)
     df_incidents = pd.read_sql_query("SELECT * FROM incident_reports ORDER BY created_at DESC LIMIT 5", conn)
+    if user["role"] in ("Teacher", "ICT Teacher"):
+        _allowed_classes = set(get_teacher_assigned_classes(conn, user["username"]))
+        df_students = df_students[df_students["class_level"].isin(_allowed_classes)].drop(
+            columns=["guardian_name", "guardian_phone"], errors="ignore"
+        )
+        df_teachers = df_teachers.iloc[0:0]
+        df_fees = df_fees.iloc[0:0]
+        df_occasions = df_occasions.iloc[0:0]
+        df_incidents = df_incidents.iloc[0:0]
+    elif user["role"] == "Bursar":
+        df_teachers = df_teachers.iloc[0:0]
+        df_occasions = df_occasions.iloc[0:0]
+        df_incidents = df_incidents.iloc[0:0]
+        df_students = df_students[["student_id", "full_name", "gender", "class_level", "program", "status"]]
     conn.close()
 
     # Exact Gender Totals across Learners, Teachers, and Combined School Population
@@ -1414,9 +1697,7 @@ elif menu == "📝 Student Registration & Edit":
 
     conn = get_connection()
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) AS cnt FROM students")
-    current_count = c.fetchone()["cnt"]
-    suggested_adm_no = generate_admission_number("Mensah", "Kwame", "Boateng", current_count + 1)
+    suggested_adm_no = generate_unique_admission_number(conn, "Mensah", "Kwame", "Boateng")
 
     tab_reg, tab_edit = st.tabs(["➕ Register New Learner", "✏️ Edit Existing Learner Entry"])
 
@@ -1466,10 +1747,8 @@ elif menu == "📝 Student Registration & Edit":
                 elif not confirm_reg:
                     st.error("Please tick the confirmation box before submitting.")
                 else:
-                    c.execute("SELECT COUNT(*) AS cnt FROM students")
-                    seq = c.fetchone()["cnt"] + 1
                     adm_no = (
-                        generate_admission_number(surname.strip(), first_name.strip(), middle_name.strip(), seq)
+                        generate_unique_admission_number(conn, surname.strip(), first_name.strip(), middle_name.strip())
                         if auto_gen
                         else custom_adm_no.strip().upper()
                     )
@@ -1506,9 +1785,12 @@ elif menu == "📝 Student Registration & Edit":
                                 ),
                             )
                             conn.commit()
+                            write_audit_log(conn, user["username"], user["role"], "Learner registered", f"{adm_no} | {full_nm} | {class_level}")
+                            conn.commit()
                             st.success(f"Learner **{full_nm}** registered with Admission No. **`{adm_no}`**!")
                         except sqlite3.IntegrityError:
-                            st.error(f"Admission Number `{adm_no}` already exists. Please submit again.")
+                            conn.rollback()
+                            st.error(f"Admission Number `{adm_no}` already exists. Please review the details and submit again.")
 
     with tab_edit:
         students_rows = c.execute("SELECT * FROM students ORDER BY full_name ASC").fetchall()
@@ -1877,6 +2159,10 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
                 st.error("Please tick the confirmation box before submitting.")
             elif create_login and (not t_user.strip() or not t_pass.strip()):
                 st.error("Please provide Username and Password for the teacher portal login.")
+            elif create_login and len(t_user.strip()) < 3:
+                st.error("Portal username must contain at least 3 characters.")
+            elif create_login and len(t_pass) < 10:
+                st.error("For account security, use a portal password with at least 10 characters.")
             elif not assign_all_classes and not assigned_cls_levels:
                 st.error("Select at least one class, or tick 'Teacher handles ALL classes'.")
             else:
@@ -1956,11 +2242,10 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
                 "SELECT assigned_class_level FROM teachers WHERE staff_id = ?", (chosen_staff_id,)
             ).fetchone()
             legacy_value = (legacy_row["assigned_class_level"] or "").strip() if legacy_row else ""
-            current_allocations = CLASS_LEVELS if legacy_value in ("", "All / Multiple Classes") else [
-                part.strip() for part in legacy_value.split(",") if part.strip() in CLASS_LEVELS
-            ]
-        if not current_allocations:
-            current_allocations = list(CLASS_LEVELS)
+            if legacy_value.lower() in ("all", "all classes", "all / multiple classes"):
+                current_allocations = list(CLASS_LEVELS)
+            else:
+                current_allocations = [part.strip() for part in legacy_value.split(",") if part.strip() in CLASS_LEVELS]
         allocation_all = st.checkbox(
             "This teacher handles ALL classes", value=(len(current_allocations) == len(CLASS_LEVELS)),
             key=f"allocation_all_{chosen_staff_id}"
@@ -2015,12 +2300,13 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
 # MODULE 4: SCHOOL MANAGER PROFILE, REGISTER & CLASH-FREE TIMETABLE
 # ---------------------------------------------------------
 elif menu == "👔 School Manager Profile & Timetable/Register":
-    st.header("School Manager Privileges: Passport Profile, Register & Timetable")
+    _profile_heading = "My Staff Profile, Timetable & Register" if user["role"] in ("Teacher", "ICT Teacher") else "School Manager Profile, Timetable & Register"
+    st.header(_profile_heading)
     conn = get_connection()
     c = conn.cursor()
 
     tab_mgr, tab_tt, tab_workload, tab_reg = st.tabs([
-        "🪪 School Manager Profile & Passport",
+        "🪪 My Profile & Passport",
         "🗓️ Clash-Free Timetable Generator",
         "📊 Teacher Workload & Timetable",
         "📋 School Register Generator",
@@ -2036,8 +2322,8 @@ elif menu == "👔 School Manager Profile & Timetable/Register":
             with m3:
                 m_middle = st.text_input("Manager Middle Name", placeholder="e.g., Kofi")
             m_photo = st.file_uploader("Upload Passport-Sized Picture (School Manager)", type=["png", "jpg", "jpeg"])
-            confirm_m = st.checkbox("Confirm School Manager details before saving.")
-            if st.form_submit_button("Save School Manager Profile"):
+            confirm_m = st.checkbox("Confirm your profile details before saving.")
+            if st.form_submit_button("Save My Profile"):
                 if not confirm_m:
                     st.error("Please confirm before saving.")
                 elif not m_surname.strip() or not m_first.strip():
@@ -2053,7 +2339,7 @@ elif menu == "👔 School Manager Profile & Timetable/Register":
                     conn.commit()
                     st.session_state.user["full_name"] = m_full
                     st.session_state.user["passport_photo"] = p_bytes
-                    st.success(f"School Manager profile updated: **{m_full}**!")
+                    st.success(f"Profile updated: **{m_full}**!")
 
     with tab_tt:
         st.subheader("Automatic Clash-Free School Timetable")
@@ -2062,23 +2348,28 @@ elif menu == "👔 School Manager Profile & Timetable/Register":
         with st.form("timetable_gen_form"):
             t1, t2 = st.columns(2)
             with t1:
-                target_cls = st.selectbox("Select Class / Grade Level", CLASS_LEVELS)
+                _timetable_classes = get_teacher_assigned_classes(conn, user["username"]) if user["role"] in ("Teacher", "ICT Teacher") else CLASS_LEVELS
+                target_cls = st.selectbox("Select Class / Grade Level", _timetable_classes or ["No class assigned"], disabled=not bool(_timetable_classes))
                 gen_choice = st.radio(
                     "Choose Timetable Generation Option",
                     [
                         "Option A: Full Week Clash-Free Auto-Schedule (Mon–Fri, 6 Periods)",
                         "Option B: Core & Primary Subjects Auto-Schedule (Mon–Fri, 4 Periods)",
                     ],
+                    disabled=user["role"] in ("Teacher", "ICT Teacher"),
                 )
             with t2:
                 selected_subs = st.multiselect(
                     "Subjects to Include",
                     SUBJECTS_LIST,
                     default=["RME", "Social Studies", "Mathematics", "English Language", "Integrated Science", "ICT (Core/Elective)"],
+                    disabled=user["role"] in ("Teacher", "ICT Teacher"),
                 )
-            confirm_tt = st.checkbox("Confirm timetable generation for selected class.")
-            if st.form_submit_button("Generate Clash-Free Timetable"):
-                if not confirm_tt:
+            confirm_tt = st.checkbox("Confirm timetable generation for selected class.", disabled=user["role"] in ("Teacher", "ICT Teacher"))
+            if st.form_submit_button("Generate Clash-Free Timetable", disabled=user["role"] in ("Teacher", "ICT Teacher") or not bool(_timetable_classes)):
+                if user["role"] in ("Teacher", "ICT Teacher"):
+                    st.error("Timetable generation is reserved for the School Manager or Admin. You can view your assigned class timetable below.")
+                elif not confirm_tt:
                     st.error("Please confirm before generating the timetable.")
                 else:
                     days_list = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
@@ -2089,38 +2380,56 @@ elif menu == "👔 School Manager Profile & Timetable/Register":
                         slots_list = ["08:00-09:30", "09:30-11:00", "11:30-13:00", "13:00-14:30"]
                         mode_label = "Option B (4-Period Clash-Free)"
 
-                    ins_cnt, skip_cnt = generate_clash_free_timetable(
-                        conn, target_cls, days_list, slots_list, selected_subs, mode_label, user["full_name"]
-                    )
-                    st.success(f"Timetable generated for **{target_cls}** ({ins_cnt} slots scheduled, {skip_cnt} teacher conflicts avoided).")
+                    try:
+                        ins_cnt, skip_cnt = generate_clash_free_timetable(
+                            conn, target_cls, days_list, slots_list, selected_subs, mode_label, user["full_name"]
+                        )
+                        if ins_cnt:
+                            write_audit_log(conn, user["username"], user["role"], "Timetable generated", f"{target_cls}: {ins_cnt} slots; {skip_cnt} skipped")
+                            conn.commit()
+                            st.success(f"Timetable updated for **{target_cls}** ({ins_cnt} slots scheduled, {skip_cnt} unavailable / conflicting slots skipped).")
+                        else:
+                            st.warning("No valid teacher/subject assignments were available. The previously saved timetable was preserved.")
+                    except Exception as timetable_error:
+                        conn.rollback()
+                        st.error(f"Timetable could not be updated. The previous timetable was preserved: {timetable_error}")
 
         tt_df = pd.read_sql_query(
             "SELECT class_level AS 'Class', day_of_week AS 'Day', time_slot AS 'Time', subject AS 'Subject', teacher_name AS 'Teacher', mode_used AS 'Mode' FROM school_timetable ORDER BY slot_id ASC",
             conn,
         )
+        if user["role"] in ("Teacher", "ICT Teacher"):
+            _view_classes = set(get_teacher_assigned_classes(conn, user["username"]))
+            tt_df = tt_df[tt_df["Class"].isin(_view_classes)]
         if not tt_df.empty:
             st.dataframe(tt_df, use_container_width=True)
 
     with tab_workload:
         st.subheader("Teacher Workload Overview")
         st.caption("Review each teacher's weekly teaching periods and inspect their assigned timetable. Counts are based on the timetable currently saved in the system.")
-        workload_df = pd.read_sql_query(
-            """
-            SELECT teacher_name AS 'Teacher', COUNT(*) AS 'Weekly Periods',
-                   COUNT(DISTINCT class_level) AS 'Classes',
-                   COUNT(DISTINCT subject) AS 'Subjects'
-            FROM school_timetable
-            GROUP BY teacher_name
-            ORDER BY COUNT(*) DESC, teacher_name ASC
-            """,
-            conn,
-        )
+        if user["role"] in ("Teacher", "ICT Teacher"):
+            _linked_teacher = conn.execute("SELECT full_name FROM teachers WHERE username = ?", (user["username"],)).fetchone()
+            _workload_name = _linked_teacher["full_name"] if _linked_teacher else user["full_name"]
+            workload_df = pd.read_sql_query(
+                """SELECT teacher_name AS 'Teacher', COUNT(*) AS 'Weekly Periods',
+                          COUNT(DISTINCT class_level) AS 'Classes', COUNT(DISTINCT subject) AS 'Subjects'
+                   FROM school_timetable WHERE teacher_name = ? GROUP BY teacher_name""",
+                conn, params=(_workload_name,),
+            )
+        else:
+            workload_df = pd.read_sql_query(
+                """SELECT teacher_name AS 'Teacher', COUNT(*) AS 'Weekly Periods',
+                          COUNT(DISTINCT class_level) AS 'Classes', COUNT(DISTINCT subject) AS 'Subjects'
+                   FROM school_timetable GROUP BY teacher_name
+                   ORDER BY COUNT(*) DESC, teacher_name ASC""",
+                conn,
+            )
         if workload_df.empty:
             st.info("No timetable entries are available yet. Generate a class timetable to see teacher workloads here.")
         else:
             st.dataframe(workload_df, use_container_width=True, hide_index=True)
             teacher_options = sorted(workload_df["Teacher"].dropna().astype(str).unique().tolist())
-            chosen_teacher = st.selectbox("View individual teacher timetable", teacher_options, key="workload_teacher_view")
+            chosen_teacher = st.selectbox("View individual teacher timetable", teacher_options, key="workload_teacher_view", disabled=user["role"] in ("Teacher", "ICT Teacher"))
             teacher_tt_df = pd.read_sql_query(
                 """
                 SELECT class_level AS 'Class', day_of_week AS 'Day', time_slot AS 'Time',
@@ -2146,11 +2455,12 @@ elif menu == "👔 School Manager Profile & Timetable/Register":
             with r1:
                 reg_date = st.date_input("Register Date", value=datetime.now().date())
             with r2:
-                reg_class = st.selectbox("Class / Grade Level", CLASS_LEVELS, key="reg_cls_sel")
+                _register_classes = get_teacher_assigned_classes(conn, user["username"]) if user["role"] in ("Teacher", "ICT Teacher") else CLASS_LEVELS
+                reg_class = st.selectbox("Class / Grade Level", _register_classes or ["No class assigned"], key="reg_cls_sel", disabled=not bool(_register_classes))
             with r3:
                 default_att = st.selectbox("Default Attendance Mark", ["Present", "Absent", "Late"])
             confirm_r = st.checkbox("Confirm school register generation.")
-            if st.form_submit_button("Generate / Sync School Register"):
+            if st.form_submit_button("Generate / Sync School Register", disabled=not bool(_register_classes)):
                 if not confirm_r:
                     st.error("Please confirm before generating the school register.")
                 else:
@@ -2180,6 +2490,8 @@ elif menu == "👔 School Manager Profile & Timetable/Register":
             "SELECT register_date AS 'Date', class_level AS 'Class', student_id AS 'Adm. No.', student_name AS 'Learner Name', attendance_status AS 'Status', generated_by AS 'By' FROM school_register ORDER BY reg_id DESC",
             conn,
         )
+        if user["role"] in ("Teacher", "ICT Teacher") and not reg_df.empty:
+            reg_df = reg_df[reg_df["Class"].isin(set(get_teacher_assigned_classes(conn, user["username"]))) ]
         if not reg_df.empty:
             st.dataframe(reg_df, use_container_width=True)
 
@@ -2195,17 +2507,21 @@ elif menu == "📖 Daily/Weekly Lessons & Remaining Topics":
     c = conn.cursor()
     lesson_class_options = (
         get_teacher_assigned_classes(conn, user["username"])
-        if user["role"] == "Teacher" else list(CLASS_LEVELS)
+        if user["role"] in ("Teacher", "ICT Teacher") else list(CLASS_LEVELS)
     )
     if not lesson_class_options:
-        lesson_class_options = list(CLASS_LEVELS)
+        conn.close()
+        st.error("This teacher account has no class allocation linked to a teacher profile. Ask the Admin to link the account and assign classes.")
+        st.stop()
 
     with st.form("lesson_log_form", clear_on_submit=False):
         l1, l2, l3 = st.columns(3)
         with l1:
             l_class = st.selectbox("Class / Grade Level", lesson_class_options)
         with l2:
-            l_subject = st.selectbox("Subject", SUBJECTS_LIST)
+            _teacher_subject = user.get("assigned_subject")
+            _lesson_subjects = [_teacher_subject] if user["role"] in ("Teacher", "ICT Teacher") and _teacher_subject in SUBJECTS_LIST else SUBJECTS_LIST
+            l_subject = st.selectbox("Subject", _lesson_subjects)
         with l3:
             period_type = st.selectbox("Log Frequency", ["Daily", "Weekly"])
         log_date = st.date_input("Date", value=datetime.now().date())
@@ -2279,10 +2595,12 @@ elif menu == "🧮 Continuous Assessment & Score Entry":
         with top1:
             term = st.selectbox("Academic Term", ["2026/2027 - Term 1", "2026/2027 - Term 2", "2026/2027 - Term 3"], key="ass_term_sel")
         with top2:
-            subject = st.selectbox("Subject", SUBJECTS_LIST, key="ass_sub_sel")
+            _teacher_subject = user.get("assigned_subject")
+            _assessment_subjects = [_teacher_subject] if user["role"] in ("Teacher", "ICT Teacher") and _teacher_subject in SUBJECTS_LIST else SUBJECTS_LIST
+            subject = st.selectbox("Subject", _assessment_subjects, key="ass_sub_sel")
         with top3:
             class_choices = sorted(students["class_level"].dropna().unique().tolist())
-            if user["role"] == "Teacher":
+            if user["role"] in ("Teacher", "ICT Teacher"):
                 permitted_classes = set(get_teacher_assigned_classes(conn, user["username"]))
                 class_choices = [level for level in class_choices if level in permitted_classes]
             if not class_choices:
@@ -2535,7 +2853,7 @@ elif menu == "🎓 Student Certificates & Term Honours":
     conn = get_connection()
     c = conn.cursor()
     students_rows = c.execute("SELECT * FROM students ORDER BY full_name ASC").fetchall()
-    if user["role"] == "Teacher":
+    if user["role"] in ("Teacher", "ICT Teacher"):
         permitted_classes = set(get_teacher_assigned_classes(conn, user["username"]))
         students_rows = [row for row in students_rows if row["class_level"] in permitted_classes]
 
@@ -2570,7 +2888,7 @@ elif menu == "🎓 Student Certificates & Term Honours":
                 citation_txt = st.text_area("Certificate Citation", value=default_citation, height=95)
                 mgr_signatory = st.text_input("School Manager Signatory Name", value=user["full_name"])
 
-            cert_no = f"GIS-CERT-{stu_obj['student_id']}-{datetime.now().strftime('%Y%m%d')}"
+            cert_no = f"GIS-CERT-{re.sub(r'[^A-Za-z0-9_-]+', '-', str(stu_obj['student_id']))}-{datetime.now().strftime('%Y%m%d')}"
             issue_dt = datetime.now().strftime("%d %B %Y")
             pdf_cert = generate_student_certificate_pdf(
                 stu_obj, cert_no, cert_title, cert_sub, citation_txt, issue_dt, mgr_signatory
@@ -2578,7 +2896,7 @@ elif menu == "🎓 Student Certificates & Term Honours":
 
             col_dl1, col_dl2 = st.columns(2)
             with col_dl1:
-                if st.button("Log & Download Certificate of Completion"):
+                if st.button("Record Certificate in Issued Certificates Log"):
                     c.execute(
                         """
                         INSERT OR IGNORE INTO issued_certificates (
@@ -2588,12 +2906,17 @@ elif menu == "🎓 Student Certificates & Term Honours":
                         (cert_no, stu_obj["student_id"], stu_obj["full_name"], cert_title, issue_dt, user["full_name"]),
                     )
                     conn.commit()
-                    st.success(f"Certificate `{cert_no}` logged!")
+                    if c.rowcount:
+                        write_audit_log(conn, user["username"], user["role"], "Certificate issued", f"{cert_no} | {stu_obj['student_id']}")
+                        conn.commit()
+                        st.success(f"Certificate `{cert_no}` recorded in the issued-certificate log.")
+                    else:
+                        st.info("This certificate number is already recorded. You can still download the PDF.")
             with col_dl2:
                 st.download_button(
                     label="📥 Download PDF Certificate of Completion",
                     data=pdf_cert,
-                    file_name=f"{stu_obj['student_id']}_Completion_Certificate.pdf",
+                    file_name=f"{re.sub(r'[^A-Za-z0-9_-]+', '_', str(stu_obj['student_id']))}_Completion_Certificate.pdf",
                     mime="application/pdf",
                 )
 
@@ -2605,7 +2928,9 @@ elif menu == "🎓 Student Certificates & Term Honours":
         with t_col1:
             eval_term = st.selectbox("Select Academic Term", ["2026/2027 - Term 1", "2026/2027 - Term 2", "2026/2027 - Term 3"])
         with t_col2:
-            eval_class = st.selectbox("Filter Class / Grade Level", ["All Classes"] + CLASS_LEVELS, key="cert_term_cls")
+            _cert_classes = get_teacher_assigned_classes(conn, user["username"]) if user["role"] in ("Teacher", "ICT Teacher") else CLASS_LEVELS
+            eval_class_options = ["All Classes"] + _cert_classes
+            eval_class = st.selectbox("Filter Class / Grade Level", eval_class_options, key="cert_term_cls")
         with t_col3:
             qual_threshold = st.number_input("Minimum Qualifying Average (%)", min_value=40.0, max_value=95.0, value=60.0, step=2.5)
 
@@ -2625,10 +2950,17 @@ elif menu == "🎓 Student Certificates & Term Honours":
             WHERE a.term = ? AND s.status = 'Active'
         """
         params = [eval_term]
+        if user["role"] in ("Teacher", "ICT Teacher"):
+            if _cert_classes:
+                class_placeholders = ",".join("?" for _ in _cert_classes)
+                query += f" AND s.class_level IN ({class_placeholders})"
+                params.extend(_cert_classes)
+            else:
+                query += " AND 1 = 0"
         if eval_class != "All Classes":
             query += " AND s.class_level = ?"
             params.append(eval_class)
-        query += " GROUP BY s.student_id ORDER BY overall_avg DESC"
+        query += " GROUP BY s.student_id HAVING AVG(a.total_score) IS NOT NULL ORDER BY overall_avg DESC"
 
         term_eval_rows = [dict(r) for r in c.execute(query, params).fetchall()]
 
@@ -2666,7 +2998,8 @@ elif menu == "🎓 Student Certificates & Term Honours":
                 chosen_q = st.selectbox("Select Qualified Pupil to Generate Overall Term Certificate", list(q_map.keys()))
                 q_stu = q_map[chosen_q]
 
-                term_cert_no = f"GIS-TERM-{q_stu['student_id']}-{datetime.now().strftime('%Y%m%d')}"
+                term_code = re.sub(r"[^A-Za-z0-9]+", "", eval_term)
+                term_cert_no = f"GIS-TERM-{re.sub(r'[^A-Za-z0-9_-]+', '-', str(q_stu['student_id']))}-{term_code}-{datetime.now().strftime('%Y%m%d')}"
                 term_issue_dt = datetime.now().strftime("%d %B %Y")
                 term_citation = (
                     f"having demonstrated commendable academic excellence and discipline during {eval_term} in "
@@ -2687,8 +3020,9 @@ elif menu == "🎓 Student Certificates & Term Honours":
                 c_t1, c_t2 = st.columns(2)
                 with c_t1:
                     if st.button("Record All Qualified Pupils in Certificate Log"):
+                        newly_logged = 0
                         for item in qualified_list:
-                            c_no = f"GIS-TERM-{item['student_id']}-{eval_term.replace(' ', '').replace('/', '')}"
+                            c_no = f"GIS-TERM-{re.sub(r'[^A-Za-z0-9_-]+', '-', str(item['student_id']))}-{term_code}-{datetime.now().strftime('%Y%m%d')}"
                             c.execute(
                                 """
                                 INSERT OR IGNORE INTO issued_certificates (
@@ -2697,13 +3031,16 @@ elif menu == "🎓 Student Certificates & Term Honours":
                                 """,
                                 (c_no, item["student_id"], item["full_name"], eval_term, item["overall_avg"], item["honour_tier"], term_issue_dt, user["full_name"]),
                             )
+                            newly_logged += max(c.rowcount, 0)
                         conn.commit()
-                        st.success(f"Logged certificates for all **{len(qualified_list)}** qualified pupils!")
+                        write_audit_log(conn, user["username"], user["role"], "Bulk term certificates recorded", f"{eval_term} | {newly_logged} new of {len(qualified_list)} qualified learners")
+                        conn.commit()
+                        st.success(f"Added **{newly_logged}** new certificate record(s). {len(qualified_list) - newly_logged} were already in the log.")
                 with c_t2:
                     st.download_button(
                         label="📥 Download Selected Pupil's End-of-Term Certificate (PDF)",
                         data=term_pdf,
-                        file_name=f"{q_stu['student_id']}_{eval_term.replace('/', '_')}_Term_Certificate.pdf",
+                        file_name=f"{re.sub(r'[^A-Za-z0-9_-]+', '_', str(q_stu['student_id']))}_{re.sub(r'[^A-Za-z0-9_-]+', '_', eval_term)}_Term_Certificate.pdf",
                         mime="application/pdf",
                     )
             else:
@@ -2720,21 +3057,20 @@ elif menu == "📥 CSV File Generator & Data Export":
     st.caption("Filter school records by dataset, gender, class / grade level, or term and download ready-to-use CSV files.")
 
     conn = get_connection()
-    dataset_choice = st.selectbox(
-        "Select Dataset to Export as CSV",
-        [
-            "Students Register",
-            "Teachers Directory",
+    if user["role"] == "Bursar":
+        _export_datasets = ["Fee Payments Ledger", "Teacher Salary Payments"]
+    elif user["role"] in ("Teacher", "ICT Teacher"):
+        _export_datasets = ["Student Assessments & Grades", "School Attendance Register", "School Timetable"]
+    else:
+        _export_datasets = [
+            "Students Register", "Teachers Directory",
             "Combined Population (Students + Teachers with Gender Summary)",
-            "Student Assessments & Grades",
-            "Qualified End-of-Term Pupils",
-            "Fee Payments Ledger",
-            "Teacher Salary Payments",
-            "School Attendance Register",
-            "School Timetable",
+            "Student Assessments & Grades", "Qualified End-of-Term Pupils",
+            "Fee Payments Ledger", "Teacher Salary Payments",
+            "School Attendance Register", "School Timetable",
             "Incident Reports & Special Occasions",
-        ],
-    )
+        ]
+    dataset_choice = st.selectbox("Select Dataset to Export as CSV", _export_datasets)
 
     f1, f2, f3 = st.columns(3)
     with f1:
@@ -2856,6 +3192,16 @@ elif menu == "📥 CSV File Generator & Data Export":
     else:
         export_df = pd.read_sql_query("SELECT * FROM incident_reports ORDER BY incident_id DESC", conn)
 
+    if user["role"] in ("Teacher", "ICT Teacher") and not export_df.empty:
+        _assigned = set(get_teacher_assigned_classes(conn, user["username"]))
+        for _class_col in ("Class_Level", "class_level", "Class"):
+            if _class_col in export_df.columns:
+                export_df = export_df[export_df[_class_col].isin(_assigned)]
+                break
+        _assigned_subject = user.get("assigned_subject")
+        if _assigned_subject and "Subject" in export_df.columns:
+            export_df = export_df[export_df["Subject"] == _assigned_subject]
+
     conn.close()
 
     st.subheader(f"Preview: {dataset_choice} ({len(export_df)} row(s))")
@@ -2881,12 +3227,14 @@ elif menu == "💰 Fees, Teacher Salaries & Occasions/Incidents":
     conn = get_connection()
     c = conn.cursor()
 
-    t_fees, t_sal, t_occ, t_inc = st.tabs([
-        "💳 School Fees & Receipts",
-        "💵 Teacher Salary Payments",
-        "🎉 Special Activities / Occasions",
-        "⚠️ Incident Reports",
-    ])
+    if user["role"] == "Bursar":
+        t_fees, t_sal = st.tabs(["💳 School Fees & Receipts", "💵 Teacher Salary Payments"])
+        t_occ = t_inc = None
+    else:
+        t_fees, t_sal, t_occ, t_inc = st.tabs([
+            "💳 School Fees & Receipts", "💵 Teacher Salary Payments",
+            "🎉 Special Activities / Occasions", "⚠️ Incident Reports",
+        ])
 
     with t_fees:
         students = pd.read_sql_query("SELECT * FROM students WHERE status='Active' ORDER BY full_name ASC", conn)
@@ -3067,73 +3415,75 @@ elif menu == "💰 Fees, Teacher Salaries & Occasions/Incidents":
         if not sal_df.empty:
             st.dataframe(sal_df, use_container_width=True)
 
-    with t_occ:
-        st.subheader("Special Activities & Occasions Report Entry")
-        with st.form("occasion_form", clear_on_submit=True):
-            o1, o2, o3 = st.columns(3)
-            with o1:
-                occ_title = st.text_input("Activity / Occasion Title *", placeholder="e.g., Inter-House Sports / Speech Day")
-            with o2:
-                occ_type = st.selectbox("Occasion Category", ["Cultural / Speech Day", "Sports Festival", "PTA / Open Day", "Excursion / Field Trip", "Special Assembly"])
-            with o3:
-                occ_date = st.date_input("Event Date", value=datetime.now().date())
-            occ_venue = st.text_input("Venue", value="School Campus, Breman Esiam")
-            occ_coord = st.text_input("Coordinator / Lead", placeholder="e.g., Academic & Events Team")
-            occ_summary = st.text_area("Occasion Report / Summary *", placeholder="Describe what happened, attendance, key highlights...")
-            conf_occ = st.checkbox("Confirm occasion report before submitting.")
-            if st.form_submit_button("Save Occasion Report"):
-                if not conf_occ:
-                    st.error("Please confirm before submitting.")
-                elif not occ_title.strip() or not occ_summary.strip():
-                    st.error("Title and Summary are required.")
-                else:
-                    c.execute(
-                        """
-                        INSERT INTO special_occasions (title, occasion_type, event_date, venue, coordinator, summary, recorded_by, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (occ_title.strip(), occ_type, occ_date.strftime("%Y-%m-%d"), occ_venue.strip(), occ_coord.strip(), occ_summary.strip(), user["full_name"], datetime.now().strftime("%Y-%m-%d %H:%M")),
-                    )
-                    conn.commit()
-                    st.success(f"Occasion report **'{occ_title}'** saved!")
+    if t_occ is not None:
+        with t_occ:
+            st.subheader("Special Activities & Occasions Report Entry")
+            with st.form("occasion_form", clear_on_submit=True):
+                o1, o2, o3 = st.columns(3)
+                with o1:
+                    occ_title = st.text_input("Activity / Occasion Title *", placeholder="e.g., Inter-House Sports / Speech Day")
+                with o2:
+                    occ_type = st.selectbox("Occasion Category", ["Cultural / Speech Day", "Sports Festival", "PTA / Open Day", "Excursion / Field Trip", "Special Assembly"])
+                with o3:
+                    occ_date = st.date_input("Event Date", value=datetime.now().date())
+                occ_venue = st.text_input("Venue", value="School Campus, Breman Esiam")
+                occ_coord = st.text_input("Coordinator / Lead", placeholder="e.g., Academic & Events Team")
+                occ_summary = st.text_area("Occasion Report / Summary *", placeholder="Describe what happened, attendance, key highlights...")
+                conf_occ = st.checkbox("Confirm occasion report before submitting.")
+                if st.form_submit_button("Save Occasion Report"):
+                    if not conf_occ:
+                        st.error("Please confirm before submitting.")
+                    elif not occ_title.strip() or not occ_summary.strip():
+                        st.error("Title and Summary are required.")
+                    else:
+                        c.execute(
+                            """
+                            INSERT INTO special_occasions (title, occasion_type, event_date, venue, coordinator, summary, recorded_by, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (occ_title.strip(), occ_type, occ_date.strftime("%Y-%m-%d"), occ_venue.strip(), occ_coord.strip(), occ_summary.strip(), user["full_name"], datetime.now().strftime("%Y-%m-%d %H:%M")),
+                        )
+                        conn.commit()
+                        st.success(f"Occasion report **'{occ_title}'** saved!")
 
-        occ_df = pd.read_sql_query("SELECT event_date AS 'Date', occasion_type AS 'Type', title AS 'Title', venue AS 'Venue', summary AS 'Report Summary' FROM special_occasions ORDER BY occasion_id DESC", conn)
-        if not occ_df.empty:
-            st.dataframe(occ_df, use_container_width=True)
+            occ_df = pd.read_sql_query("SELECT event_date AS 'Date', occasion_type AS 'Type', title AS 'Title', venue AS 'Venue', summary AS 'Report Summary' FROM special_occasions ORDER BY occasion_id DESC", conn)
+            if not occ_df.empty:
+                st.dataframe(occ_df, use_container_width=True)
 
-    with t_inc:
-        st.subheader("Incident Reports Section (Any Learner / School Case)")
-        with st.form("incident_form", clear_on_submit=True):
-            i1, i2, i3 = st.columns(3)
-            with i1:
-                inc_date = st.date_input("Incident Date", value=datetime.now().date())
-            with i2:
-                inc_class = st.selectbox("Class / Grade Level Involved", CLASS_LEVELS + ["Whole School / Compound"])
-            with i3:
-                inc_sev = st.selectbox("Severity", ["Minor", "Moderate", "Urgent / Serious"])
-            inc_person = st.text_input("Learner / Person(s) Involved *", placeholder="e.g., Name and Admission No. or group")
-            inc_desc = st.text_area("Incident Description *", placeholder="State clearly what happened, time, and witnesses...")
-            inc_action = st.text_area("Immediate Action Taken / Recommendation", placeholder="e.g., First aid given, parent called, referred to management...")
-            conf_inc = st.checkbox("Confirm incident details before submitting.")
-            if st.form_submit_button("Submit Incident Report"):
-                if not conf_inc:
-                    st.error("Please confirm before submitting.")
-                elif not inc_person.strip() or not inc_desc.strip():
-                    st.error("Person(s) Involved and Incident Description are required.")
-                else:
-                    c.execute(
-                        """
-                        INSERT INTO incident_reports (incident_date, class_level, involved_person, severity, description, action_taken, reported_by, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (inc_date.strftime("%Y-%m-%d"), inc_class, inc_person.strip(), inc_sev, inc_desc.strip(), inc_action.strip(), user["full_name"], datetime.now().strftime("%Y-%m-%d %H:%M")),
-                    )
-                    conn.commit()
-                    st.success("Incident report logged securely!")
+    if t_inc is not None:
+        with t_inc:
+            st.subheader("Incident Reports Section (Any Learner / School Case)")
+            with st.form("incident_form", clear_on_submit=True):
+                i1, i2, i3 = st.columns(3)
+                with i1:
+                    inc_date = st.date_input("Incident Date", value=datetime.now().date())
+                with i2:
+                    inc_class = st.selectbox("Class / Grade Level Involved", CLASS_LEVELS + ["Whole School / Compound"])
+                with i3:
+                    inc_sev = st.selectbox("Severity", ["Minor", "Moderate", "Urgent / Serious"])
+                inc_person = st.text_input("Learner / Person(s) Involved *", placeholder="e.g., Name and Admission No. or group")
+                inc_desc = st.text_area("Incident Description *", placeholder="State clearly what happened, time, and witnesses...")
+                inc_action = st.text_area("Immediate Action Taken / Recommendation", placeholder="e.g., First aid given, parent called, referred to management...")
+                conf_inc = st.checkbox("Confirm incident details before submitting.")
+                if st.form_submit_button("Submit Incident Report"):
+                    if not conf_inc:
+                        st.error("Please confirm before submitting.")
+                    elif not inc_person.strip() or not inc_desc.strip():
+                        st.error("Person(s) Involved and Incident Description are required.")
+                    else:
+                        c.execute(
+                            """
+                            INSERT INTO incident_reports (incident_date, class_level, involved_person, severity, description, action_taken, reported_by, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (inc_date.strftime("%Y-%m-%d"), inc_class, inc_person.strip(), inc_sev, inc_desc.strip(), inc_action.strip(), user["full_name"], datetime.now().strftime("%Y-%m-%d %H:%M")),
+                        )
+                        conn.commit()
+                        st.success("Incident report logged securely!")
 
-        inc_df = pd.read_sql_query("SELECT incident_date AS 'Date', class_level AS 'Class', involved_person AS 'Involved', severity AS 'Severity', description AS 'Description', action_taken AS 'Action Taken' FROM incident_reports ORDER BY incident_id DESC", conn)
-        if not inc_df.empty:
-            st.dataframe(inc_df, use_container_width=True)
+            inc_df = pd.read_sql_query("SELECT incident_date AS 'Date', class_level AS 'Class', involved_person AS 'Involved', severity AS 'Severity', description AS 'Description', action_taken AS 'Action Taken' FROM incident_reports ORDER BY incident_id DESC", conn)
+            if not inc_df.empty:
+                st.dataframe(inc_df, use_container_width=True)
 
     conn.close()
 
@@ -3236,7 +3586,7 @@ elif menu == "📄 Terminal Report Cards (PDF Export)":
     st.header("Automated Terminal Report Card & PDF Generator")
     conn = get_connection()
     students = pd.read_sql_query("SELECT * FROM students WHERE status='Active' ORDER BY full_name ASC", conn)
-    if user["role"] == "Teacher":
+    if user["role"] in ("Teacher", "ICT Teacher"):
         permitted_classes = set(get_teacher_assigned_classes(conn, user["username"]))
         students = students[students["class_level"].isin(permitted_classes)].copy()
     if students.empty:
@@ -3403,22 +3753,134 @@ elif menu == "📄 Terminal Report Cards (PDF Export)":
 # MODULE 12: MANAGE STAFF & ROLES
 # ---------------------------------------------------------
 elif menu == "👥 Manage Staff & Roles":
-    st.header("Staff Accounts & Role Assignment")
+    if user["role"] != "Admin":
+        st.error("Only the system Admin can assign staff roles and extra privileges.")
+        st.stop()
+
+    st.header("Staff Accounts, Position Roles & Extra Privileges")
+    st.caption("Admin accounts are protected. Assign each subordinate a position, then grant only the additional modules required for that position.")
     conn = get_connection()
     c = conn.cursor()
-    with st.form("manage_roles_form"):
-        u_rows = c.execute("SELECT username, full_name, role FROM users").fetchall()
-        u_map = {f"{r['username']} — {r['full_name']} ({r['role']})": r["username"] for r in u_rows}
-        sel_u = st.selectbox("Select Account", list(u_map.keys()))
-        new_r = st.selectbox("Assign Role", ["Manager", "Admin", "Teacher", "Bursar"])
-        conf_u = st.checkbox("Confirm role update.")
-        if st.form_submit_button("Update Role"):
-            if not conf_u:
-                st.error("Please confirm before updating.")
+    u_rows = c.execute("SELECT username, full_name, role FROM users WHERE role != 'Admin' ORDER BY full_name").fetchall()
+    if not u_rows:
+        st.info("No subordinate accounts are available for role assignment yet.")
+    else:
+        u_map = {f"{r['username']} — {r['full_name']} ({r['role']})": dict(r) for r in u_rows}
+        sel_u = st.selectbox("Select Staff Account", list(u_map.keys()), key="role_target_user")
+        selected_account = u_map[sel_u]
+        current_role = selected_account["role"] if selected_account["role"] in ASSIGNABLE_ROLES else "Teacher"
+        new_r = st.selectbox("Assign Position / Role", ASSIGNABLE_ROLES, index=ASSIGNABLE_ROLES.index(current_role), key=f"role_choice_{selected_account['username']}")
+        current_extras = get_user_extra_permissions(conn, selected_account["username"])
+        extra_choices = ROLE_EXTRA_PRIVILEGES.get(new_r, [])
+        default_extras = current_extras if new_r == current_role else []
+        selected_extras = st.multiselect(
+            "Extra Privileges (optional)",
+            options=extra_choices,
+            default=[x for x in default_extras if x in extra_choices],
+            key=f"extra_privileges_{selected_account['username']}_{new_r}",
+            help="Only position-related extra modules are shown. Admin access and account management cannot be granted here.",
+        )
+        st.info("Base permissions are automatically included for the selected role. Extra privileges add only the selected modules.")
+        with st.expander(f"View base modules included with the {new_r} role"):
+            for base_module in ROLE_BASE_PERMISSIONS.get(new_r, []):
+                st.write(f"• {base_module}")
+        if not extra_choices:
+            st.caption("There are no additional module privileges available for this position; its standard role permissions remain active.")
+        confirm_role = st.checkbox("I confirm this role and its extra privileges are appropriate.", key=f"confirm_role_{selected_account['username']}")
+        if st.button("Save Role & Extra Privileges", type="primary"):
+            if not confirm_role:
+                st.error("Please confirm the role assignment before saving.")
+            elif new_r not in ASSIGNABLE_ROLES:
+                st.error("Invalid role. Admin cannot be assigned to subordinate accounts.")
+            elif new_r in ("Teacher", "ICT Teacher") and not conn.execute(
+                "SELECT 1 FROM teachers WHERE username = ?", (selected_account["username"],)
+            ).fetchone():
+                st.error("This account has no linked teacher profile. Link it to a registered teacher profile below before assigning a teaching role.")
+            elif new_r == "ICT Teacher" and conn.execute(
+                "SELECT assigned_subject FROM teachers WHERE username = ?", (selected_account["username"],)
+            ).fetchone()["assigned_subject"] != "ICT (Core/Elective)":
+                st.error("To assign the ICT Teacher role, first set this teacher's primary subject to ICT (Core/Elective) in the Teacher Directory.")
             else:
-                c.execute("UPDATE users SET role=? WHERE username=?", (new_r, u_map[sel_u]))
-                conn.commit()
-                st.success(f"Updated role for `{u_map[sel_u]}` to **{new_r}**!")
-    df_u = pd.read_sql_query("SELECT username, full_name, srrole, assigned_subject FROM users", conn)
-    st.dataframe(df_u, use_container_width=True)
+                try:
+                    create_db_backup("staff_role_permissions")
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute("UPDATE users SET role = ? WHERE username = ? AND role != 'Admin'", (new_r, selected_account["username"]))
+                    conn.execute("DELETE FROM user_extra_permissions WHERE username = ?", (selected_account["username"],))
+                    now_value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    valid_extras = [x for x in selected_extras if x in ROLE_EXTRA_PRIVILEGES.get(new_r, [])]
+                    conn.executemany(
+                        "INSERT INTO user_extra_permissions (username, module_name, granted_by, granted_at) VALUES (?, ?, ?, ?)",
+                        [(selected_account["username"], item, user["username"], now_value) for item in valid_extras],
+                    )
+                    write_audit_log(conn, user["username"], user["role"], "Staff role/privileges updated", f"{selected_account['username']}: {new_r}; extras={', '.join(valid_extras)}")
+                    conn.commit()
+                    st.success(f"Updated `{selected_account['username']}` to **{new_r}** with {len(valid_extras)} extra privilege(s).")
+                    st.rerun()
+                except Exception as role_error:
+                    conn.rollback()
+                    st.error(f"Role update failed safely: {role_error}")
+
+    st.divider()
+    st.subheader("Link an Existing Portal Account to a Teacher Profile")
+    unlinked_profiles = c.execute(
+        "SELECT staff_id, full_name, assigned_subject FROM teachers WHERE username IS NULL OR TRIM(username) = '' ORDER BY full_name"
+    ).fetchall()
+    available_accounts = c.execute(
+        """SELECT username, full_name, role FROM users
+           WHERE role != 'Admin'
+             AND username NOT IN (SELECT username FROM teachers WHERE username IS NOT NULL AND TRIM(username) != '')
+           ORDER BY full_name"""
+    ).fetchall()
+    if unlinked_profiles and available_accounts:
+        profile_map = {f"{r['full_name']} ({r['staff_id']}) — {r['assigned_subject']}": dict(r) for r in unlinked_profiles}
+        account_map = {f"{r['username']} — {r['full_name']} ({r['role']})": dict(r) for r in available_accounts}
+        with st.form("link_teacher_account_form"):
+            selected_profile_label = st.selectbox("Registered Teacher Profile", list(profile_map.keys()))
+            selected_account_label = st.selectbox("Teaching Portal Account", list(account_map.keys()))
+            confirm_link = st.checkbox("Confirm that this portal account belongs to the selected teacher.")
+            if st.form_submit_button("Link Teacher Profile to Portal Account"):
+                if not confirm_link:
+                    st.error("Please confirm the identity match before linking.")
+                else:
+                    profile = profile_map[selected_profile_label]
+                    account = account_map[selected_account_label]
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        conn.execute("UPDATE teachers SET username = ? WHERE staff_id = ? AND (username IS NULL OR TRIM(username) = '')", (account["username"], profile["staff_id"]))
+                        conn.execute("UPDATE users SET role = 'Teacher', assigned_subject = ?, full_name = ? WHERE username = ? AND role != 'Admin'", (profile["assigned_subject"], profile["full_name"], account["username"]))
+                        conn.execute("DELETE FROM user_extra_permissions WHERE username = ?", (account["username"],))
+                        write_audit_log(conn, user["username"], user["role"], "Teacher portal account linked", f"{account['username']} -> {profile['staff_id']}")
+                        conn.commit()
+                        st.success(f"Linked `{account['username']}` to teacher profile `{profile['staff_id']}`.")
+                        st.rerun()
+                    except Exception as link_error:
+                        conn.rollback()
+                        st.error(f"Could not link teacher account: {link_error}")
+    elif not unlinked_profiles:
+        st.caption("All registered teacher profiles are already linked to portal accounts.")
+    else:
+        st.caption("No unlinked subordinate portal accounts are available. Register a teacher profile or create a subordinate account first.")
+
+    st.divider()
+    st.subheader("Recent System Audit Trail")
+    audit_df = pd.read_sql_query(
+        "SELECT created_at AS 'Date / Time', username AS 'Account', role AS 'Role', action AS 'Action', details AS 'Details' FROM system_audit_log ORDER BY audit_id DESC LIMIT 100",
+        conn,
+    )
+    if audit_df.empty:
+        st.caption("No audit events have been recorded yet.")
+    else:
+        st.dataframe(audit_df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("Staff Role & Privilege Directory")
+    df_u = pd.read_sql_query("SELECT username, full_name, role, assigned_subject FROM users ORDER BY role, full_name", conn)
+    extra_rows = c.execute("SELECT username, module_name FROM user_extra_permissions ORDER BY username, module_name").fetchall()
+    extra_map = {}
+    for extra_row in extra_rows:
+        extra_map.setdefault(extra_row["username"], []).append(extra_row["module_name"])
+    if not df_u.empty:
+        df_u["Extra Privileges"] = df_u["username"].map(lambda name: ", ".join(extra_map.get(name, [])) or "None")
+        st.dataframe(df_u, use_container_width=True)
+    st.caption("The Admin account is not selectable for role changes and no subordinate role can be changed to Admin.")
     conn.close()
