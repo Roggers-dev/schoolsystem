@@ -1485,15 +1485,30 @@ if st.sidebar.button("Logout"):
     st.rerun()
 
 with st.sidebar.expander("🔐 Change My Password"):
-    with st.sidebar.form(f"change_password_form_{user['username']}"):
-        current_password = st.sidebar.text_input("Current Password", type="password", key=f"current_password_{user['username']}")
-        new_password = st.sidebar.text_input("New Password (10+ characters)", type="password", key=f"new_password_{user['username']}")
-        confirm_new_password = st.sidebar.text_input("Confirm New Password", type="password", key=f"confirm_password_{user['username']}")
-        change_password_clicked = st.sidebar.form_submit_button("Update My Password")
-        if change_password_clicked:
-            password_conn = get_connection()
+    # Widgets inside a form must use the active container (st.*), not
+    # st.sidebar.* again. Re-entering the sidebar context while a form is
+    # active triggers StreamlitInvalidLayoutContextError.
+    with st.form(f"change_password_form_{user['username']}"):
+        current_password = st.text_input(
+            "Current Password", type="password",
+            key=f"current_password_{user['username']}"
+        )
+        new_password = st.text_input(
+            "New Password (10+ characters)", type="password",
+            key=f"new_password_{user['username']}"
+        )
+        confirm_new_password = st.text_input(
+            "Confirm New Password", type="password",
+            key=f"confirm_password_{user['username']}"
+        )
+        change_password_clicked = st.form_submit_button("Update My Password")
+
+    if change_password_clicked:
+        password_conn = get_connection()
+        try:
             stored_row = password_conn.execute(
-                "SELECT password_hash FROM users WHERE username = ?", (user["username"],)
+                "SELECT password_hash FROM users WHERE username = ?",
+                (user["username"],)
             ).fetchone()
             if not stored_row or not verify_password(current_password, stored_row["password_hash"]):
                 st.sidebar.error("The current password is incorrect.")
@@ -1508,9 +1523,17 @@ with st.sidebar.expander("🔐 Change My Password"):
                     "UPDATE users SET password_hash = ? WHERE username = ?",
                     (hash_password(new_password), user["username"]),
                 )
-                write_audit_log(password_conn, user["username"], user["role"], "Password changed", "Account owner changed their password")
+                write_audit_log(
+                    password_conn, user["username"], user["role"],
+                    "Password changed", "Account owner changed their password"
+                )
                 password_conn.commit()
                 st.sidebar.success("Your password has been updated securely.")
+        except Exception:
+            password_conn.rollback()
+            st.sidebar.error("Your password could not be updated. Please try again.")
+            raise
+        finally:
             password_conn.close()
 
 if not nav_options:
