@@ -157,9 +157,44 @@ def pdf_safe_text(value):
 
 
 def pdf_output_bytes(pdf):
-    """Return PDF bytes consistently across supported PyFPDF / fpdf2 versions."""
+    """Return clean PDF bytes across legacy PyFPDF and modern fpdf2 releases.
+
+    Both libraries have changed the return type and output API over time.  The
+    default output() call is the most compatible path; normalize strings,
+    bytearrays and memoryviews, and remove an optional BOM before validation.
+    """
     output = pdf.output()
-    return output.encode("latin-1") if isinstance(output, str) else bytes(output)
+    if output is None:
+        raise RuntimeError("The PDF library returned no document data.")
+    if isinstance(output, str):
+        data = output.encode("latin-1", errors="replace")
+    elif isinstance(output, (bytes, bytearray, memoryview)):
+        data = bytes(output)
+    else:
+        try:
+            data = bytes(output)
+        except Exception as exc:
+            raise TypeError(
+                f"Unsupported PDF output type: {type(output).__name__}"
+            ) from exc
+
+    # A few wrappers prepend a UTF-8 BOM or whitespace before the PDF header.
+    header_at = data.find(b"%PDF-")
+    if 0 <= header_at <= 1024:
+        data = data[header_at:]
+    return data
+
+
+def validate_pdf_bytes(data):
+    """Reject empty, truncated, or non-PDF output before offering a download."""
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise TypeError("PDF output must be bytes.")
+    payload = bytes(data)
+    if not payload.startswith(b"%PDF-"):
+        raise ValueError("PDF generation failed: the file header is missing.")
+    if b"%%EOF" not in payload[-2048:]:
+        raise ValueError("PDF generation failed: the file appears incomplete.")
+    return payload
 
 
 def create_db_backup(reason: str = "auto"):
@@ -1041,7 +1076,7 @@ def generate_terminal_report_pdf(student_info, term, report_df, overall_total, o
     pdf.cell(95, 5, "Class Teacher's Signature", align="C")
     pdf.cell(95, 5, "School Manager Signature", align="C", ln=True)
 
-    return pdf_output_bytes(pdf)
+    return validate_pdf_bytes(pdf_output_bytes(pdf))
 
 
 def generate_class_report_cards_pdf(class_records):
@@ -1104,7 +1139,7 @@ def generate_class_report_cards_pdf(class_records):
         pdf.cell(95, 5, "Class Teacher's Signature", align="C")
         pdf.cell(95, 5, "School Manager Signature", align="C", ln=True)
 
-    return pdf_output_bytes(pdf)
+    return validate_pdf_bytes(pdf_output_bytes(pdf))
 
 
 def generate_student_certificate_pdf(
@@ -1283,9 +1318,7 @@ def generate_student_certificate_pdf(
         pdf.set_text_color(105, 105, 105)
         pdf.cell(261, 4, pdf_safe_text(f"Certificate No.: {cert_no}"), align="C")
 
-        result = pdf_output_bytes(pdf)
-        if not result.startswith(b"%PDF-"):
-            raise ValueError("The certificate generator did not produce a valid PDF file.")
+        result = validate_pdf_bytes(pdf_output_bytes(pdf))
         return result
     finally:
         if temp_img_path and os.path.exists(temp_img_path):
