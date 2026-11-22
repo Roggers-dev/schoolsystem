@@ -1116,7 +1116,7 @@ def generate_student_certificate_pdf(
     issued_date: str,
     manager_name: str,
 ):
-    """Build a landscape A4 certificate; safely handles missing photos and Unicode input."""
+    """Generate a polished, standards-compliant A4 landscape certificate PDF."""
     required = ("student_id", "full_name", "class_level", "program")
     missing = [key for key in required if not student_info.get(key)]
     if missing:
@@ -1125,30 +1125,67 @@ def generate_student_certificate_pdf(
     pdf = FPDF(orientation="L", unit="mm", format="A4")
     pdf.set_margins(15, 15, 15)
     pdf.set_auto_page_break(auto=False)
+    # Metadata and conservative built-in fonts maximise compatibility with common PDF readers.
+    pdf.set_title(pdf_safe_text(f"{cert_title} - {student_info['full_name']}"))
+    pdf.set_author(pdf_safe_text(SCHOOL_NAME))
+    pdf.set_subject("Official student academic certificate")
+    pdf.set_creator(pdf_safe_text(f"{SCHOOL_NAME} Management System"))
     pdf.add_page()
     temp_img_path = None
     try:
-        pdf.set_draw_color(27, 54, 93)
-        pdf.set_line_width(2.2)
-        pdf.rect(8, 8, 281, 194)
-        pdf.set_draw_color(212, 160, 23)
-        pdf.set_line_width(0.9)
-        pdf.rect(12, 12, 273, 186)
-        pdf.set_fill_color(244, 247, 251)
-        pdf.rect(14, 14, 269, 34, style="F")
+        navy = (25, 48, 82)
+        gold = (184, 142, 40)
+        pale = (246, 248, 251)
+        muted = (83, 96, 113)
 
-        pdf.set_xy(18, 17)
-        pdf.set_font("Arial", "B", 19)
-        pdf.set_text_color(27, 54, 93)
-        pdf.cell(261, 8, pdf_safe_text(SCHOOL_NAME), ln=True, align="C")
-        pdf.set_font("Arial", "B", 8)
-        pdf.set_text_color(90, 90, 90)
-        pdf.cell(261, 5, pdf_safe_text(SCHOOL_LOCATION), ln=True, align="C")
+        # Double-line frame and restrained corner accents.
+        pdf.set_draw_color(*navy)
+        pdf.set_line_width(1.7)
+        pdf.rect(7, 7, 283, 196)
+        pdf.set_draw_color(*gold)
+        pdf.set_line_width(0.65)
+        pdf.rect(11, 11, 275, 188)
+        pdf.set_fill_color(*pale)
+        pdf.rect(14, 14, 269, 35, style="F")
+
+        # Institutional heading.
+        pdf.set_xy(20, 18)
+        pdf.set_font("Arial", "B", 20)
+        pdf.set_text_color(*navy)
+        school = pdf_safe_text(SCHOOL_NAME).upper()
+        while pdf.get_string_width(school) > 235 and pdf.font_size_pt > 13:
+            pdf.set_font_size(pdf.font_size_pt - 1)
+        pdf.cell(257, 9, school, align="C")
+        pdf.set_xy(20, 29)
+        pdf.set_font("Arial", "", 9)
+        pdf.set_text_color(*muted)
+        pdf.cell(257, 5, pdf_safe_text(SCHOOL_LOCATION), align="C")
+        pdf.set_xy(20, 36)
         pdf.set_font("Arial", "I", 9)
-        pdf.set_text_color(160, 118, 10)
-        pdf.cell(261, 5, pdf_safe_text(f'"{SCHOOL_MOTTO}"'), ln=True, align="C")
+        pdf.set_text_color(*gold)
+        pdf.cell(257, 5, pdf_safe_text(f'"{SCHOOL_MOTTO}"'), align="C")
 
-        # A failed/unsupported image must never prevent the certificate from rendering.
+        # Official school certification heading and subtitle.
+        pdf.set_xy(22, 55)
+        pdf.set_font("Arial", "B", 19)
+        pdf.set_text_color(*navy)
+        title_text = pdf_safe_text(cert_title).upper()
+        while pdf.get_string_width(title_text) > 235 and pdf.font_size_pt > 12:
+            pdf.set_font_size(pdf.font_size_pt - 1)
+        pdf.cell(253, 10, title_text, align="C")
+        pdf.set_draw_color(*gold)
+        pdf.set_line_width(0.9)
+        pdf.line(88, 68, 209, 68)
+
+        pdf.set_xy(22, 72)
+        pdf.set_font("Arial", "B", 10)
+        pdf.set_text_color(*muted)
+        subtitle_text = pdf_safe_text(subtitle)
+        while pdf.get_string_width(subtitle_text) > 230 and pdf.font_size_pt > 8:
+            pdf.set_font_size(pdf.font_size_pt - 0.5)
+        pdf.cell(253, 6, subtitle_text, align="C")
+
+        # Student photograph is optional; an unsupported image never blocks PDF creation.
         photo_bytes = student_info.get("passport_photo")
         if photo_bytes:
             mime = (student_info.get("passport_mime") or "").lower()
@@ -1157,113 +1194,99 @@ def generate_student_certificate_pdf(
                 fd, temp_img_path = tempfile.mkstemp(suffix=ext)
                 with os.fdopen(fd, "wb") as tmp_f:
                     tmp_f.write(bytes(photo_bytes))
-                pdf.set_draw_color(212, 160, 23)
-                pdf.set_line_width(0.8)
-                pdf.rect(244, 52, 34, 38)
-                pdf.image(temp_img_path, x=245, y=53, w=32, h=36)
+                pdf.set_draw_color(*gold)
+                pdf.set_line_width(0.7)
+                pdf.rect(246, 82, 31, 37)
+                pdf.image(temp_img_path, x=247, y=83, w=29, h=35)
             except Exception:
                 if temp_img_path and os.path.exists(temp_img_path):
                     os.remove(temp_img_path)
                 temp_img_path = None
-                pdf.set_draw_color(180, 190, 205)
-                pdf.rect(244, 52, 34, 38)
-                pdf.set_xy(244, 68)
-                pdf.set_font("Arial", "I", 8)
-                pdf.set_text_color(130, 130, 130)
-                pdf.cell(34, 5, "Photo unavailable", align="C")
-        else:
-            pdf.set_draw_color(180, 190, 205)
-            pdf.set_line_width(0.5)
-            pdf.rect(244, 52, 34, 38)
-            pdf.set_xy(244, 68)
-            pdf.set_font("Arial", "I", 8)
-            pdf.set_text_color(130, 130, 130)
-            pdf.cell(34, 5, "Passport Photo", align="C")
 
-        pdf.set_xy(18, 53)
-        pdf.set_font("Arial", "B", 20)
-        pdf.set_text_color(27, 54, 93)
-        title_text = pdf_safe_text(cert_title).upper()
-        while pdf.get_string_width(title_text) > 210 and pdf.font_size_pt > 12:
-            pdf.set_font_size(pdf.font_size_pt - 1)
-        pdf.cell(225, 10, title_text, ln=True, align="C")
-
-        pdf.set_xy(18, 65)
-        pdf.set_font("Arial", "B", 10)
-        pdf.set_text_color(180, 130, 15)
-        subtitle_text = pdf_safe_text(subtitle)
-        while pdf.get_string_width(subtitle_text) > 210 and pdf.font_size_pt > 8:
-            pdf.set_font_size(pdf.font_size_pt - 0.5)
-        pdf.cell(225, 6, subtitle_text, ln=True, align="C")
-
-        pdf.set_xy(20, 77)
+        pdf.set_xy(25, 88)
         pdf.set_font("Arial", "", 11)
-        pdf.set_text_color(50, 50, 50)
-        pdf.cell(257, 7, "This is to proudly certify that", ln=True, align="C")
+        pdf.set_text_color(55, 55, 55)
+        pdf.cell(247, 7, "This is to certify that", align="C")
 
         student_name = pdf_safe_text(student_info["full_name"]).upper()
-        pdf.set_xy(20, 91)
-        pdf.set_font("Arial", "B", 21)
-        pdf.set_text_color(15, 35, 66)
-        while pdf.get_string_width(student_name) > 235 and pdf.font_size_pt > 12:
+        pdf.set_xy(22, 99)
+        pdf.set_font("Arial", "B", 24)
+        pdf.set_text_color(*navy)
+        while pdf.get_string_width(student_name) > 235 and pdf.font_size_pt > 14:
             pdf.set_font_size(pdf.font_size_pt - 1)
-        pdf.cell(257, 11, student_name, ln=True, align="C")
+        pdf.cell(253, 12, student_name, align="C")
+        pdf.set_draw_color(*gold)
+        pdf.set_line_width(0.6)
+        pdf.line(70, 113, 227, 113)
 
-        pdf.set_draw_color(212, 160, 23)
-        pdf.set_line_width(0.7)
-        pdf.line(78, 104, 219, 104)
-        pdf.set_xy(20, 107)
-        pdf.set_font("Arial", "B", 9)
-        pdf.set_text_color(70, 85, 105)
-        detail_line = (
-            f"Admission No.: {student_info['student_id']}   |   "
-            f"Class / Grade: {student_info['class_level']}   |   "
-            f"Programme: {student_info['program']}"
+        # Admission details in a quiet, readable information band.
+        pdf.set_fill_color(*pale)
+        pdf.set_draw_color(220, 226, 234)
+        pdf.rect(31, 119, 235, 12, style="DF")
+        pdf.set_xy(34, 122)
+        pdf.set_font("Arial", "B", 8.5)
+        pdf.set_text_color(*muted)
+        details = (
+            f"ADMISSION NO.: {student_info['student_id']}     |     "
+            f"CLASS / GRADE: {student_info['class_level']}     |     "
+            f"PROGRAMME: {student_info['program']}"
         )
-        detail_text = pdf_safe_text(detail_line)
-        while pdf.get_string_width(detail_text) > 250 and pdf.font_size_pt > 7:
+        while pdf.get_string_width(pdf_safe_text(details)) > 226 and pdf.font_size_pt > 7:
             pdf.set_font_size(pdf.font_size_pt - 0.5)
-        pdf.cell(257, 6, detail_text, ln=True, align="C")
+        pdf.cell(229, 6, pdf_safe_text(details), align="C")
 
-        # Wrap and cap the citation so it cannot overlap the signature footer.
+        # Citation is wrapped and constrained to its own reserved area.
         citation = pdf_safe_text(citation_text).replace("\r", " ").replace("\n", " ")
         pdf.set_font("Arial", "", 10)
-        max_width = 225
-        words = citation.split()
-        lines, current = [], ""
+        words, lines, current = citation.split(), [], ""
         for word in words:
             candidate = f"{current} {word}".strip()
-            if current and pdf.get_string_width(candidate) > max_width:
+            if current and pdf.get_string_width(candidate) > 220:
                 lines.append(current)
                 current = word
             else:
                 current = candidate
         if current:
             lines.append(current)
-        if len(lines) > 5:
-            lines = lines[:5]
-            last = lines[-1]
-            while last and pdf.get_string_width(last + "...") > max_width:
-                last = last.rsplit(" ", 1)[0] if " " in last else ""
-            lines[-1] = (last + "...").strip()
-        pdf.set_xy(32, 118)
-        pdf.multi_cell(233, 5.5, "\n".join(lines), align="C")
+        lines = lines[:4]
+        if len(words) and not lines:
+            lines = [citation[:120]]
+        pdf.set_xy(37, 137)
+        pdf.set_font("Arial", "", 10)
+        pdf.set_text_color(55, 55, 55)
+        pdf.multi_cell(223, 5.5, "\n".join(lines), align="C")
 
-        pdf.set_xy(22, 165)
-        pdf.set_font("Arial", "B", 9)
-        pdf.set_text_color(27, 54, 93)
-        pdf.cell(80, 6, "____________________________", align="C")
-        pdf.cell(93, 6, pdf_safe_text(f"Certificate No: {cert_no}"), align="C")
-        pdf.cell(80, 6, "____________________________", align="C", ln=True)
-        pdf.set_x(22)
-        pdf.set_font("Arial", "B", 8.5)
-        pdf.cell(80, 5, "Class Teacher / Academic Head", align="C")
-        pdf.set_font("Arial", "I", 8.5)
-        pdf.cell(93, 5, pdf_safe_text(f"Issued on: {issued_date}"), align="C")
-        pdf.set_font("Arial", "B", 8.5)
-        pdf.cell(80, 5, pdf_safe_text(f"{manager_name} (School Manager)"), align="C", ln=True)
+        # Signature blocks and issue information.
+        pdf.set_draw_color(120, 130, 145)
+        pdf.set_line_width(0.35)
+        pdf.line(35, 177, 105, 177)
+        pdf.line(114, 177, 184, 177)
+        pdf.line(193, 177, 263, 177)
+        pdf.set_xy(30, 179)
+        pdf.set_font("Arial", "B", 8)
+        pdf.set_text_color(*navy)
+        pdf.cell(80, 5, "CLASS TEACHER", align="C")
+        pdf.cell(80, 5, "OFFICIAL SCHOOL STAMP", align="C")
+        pdf.cell(80, 5, "HEADTEACHER / AUTHORIZED OFFICIAL", align="C")
+        pdf.set_xy(193, 184)
+        pdf.set_font("Arial", "", 7.5)
+        pdf.set_text_color(*muted)
+        pdf.cell(70, 4, pdf_safe_text(manager_name), align="C")
+        pdf.set_xy(30, 184)
+        pdf.set_font("Arial", "", 7.5)
+        pdf.set_text_color(*muted)
+        pdf.cell(80, 4, "Name and signature", align="C")
+        pdf.set_xy(114, 184)
+        pdf.cell(80, 4, pdf_safe_text(f"DATE OF ISSUE: {issued_date}"), align="C")
+        pdf.set_xy(18, 190)
+        pdf.set_font("Arial", "", 7)
+        pdf.set_text_color(105, 105, 105)
+        pdf.cell(261, 4, pdf_safe_text(f"Certificate No.: {cert_no}"), align="C")
 
-        return pdf_output_bytes(pdf)
+        result = pdf_output_bytes(pdf)
+        if not result.startswith(b"%PDF-"):
+            raise ValueError("The certificate generator did not produce a valid PDF file.")
+        return result
     finally:
         if temp_img_path and os.path.exists(temp_img_path):
             try:
@@ -2966,7 +2989,7 @@ elif menu == "🧮 Continuous Assessment & Score Entry":
 # ---------------------------------------------------------
 elif menu == "🎓 Student Certificates & Term Honours":
     st.header("Professional Student Certificates & End-of-Term Honours")
-    st.caption("Generate official PDF certificates featuring the learner's name, passport photo, and academic citation.")
+    st.caption("Issue formal school certification documents confirming academic completion or qualification. These are official school records, not appreciation certificates.")
 
     conn = get_connection()
     c = conn.cursor()
@@ -2998,14 +3021,15 @@ elif menu == "🎓 Student Certificates & Term Honours":
                     st.info("No passport photo uploaded for this learner yet (you can add one in **Student Registration & Edit**).")
             with prev2:
                 cert_title = st.text_input("Certificate Heading", value="CERTIFICATE OF COMPLETION")
-                cert_sub = st.text_input("Certificate Subtitle", value=f"Awarded upon Successful Completion of {stu_obj['class_level']}")
+                cert_sub = st.text_input("Certificate Subtitle", value=f"OFFICIAL ACADEMIC CERTIFICATION — {stu_obj['class_level']}")
                 default_citation = (
-                    f"having diligently fulfilled all academic, moral, and practical requirements prescribed by "
-                    f"{SCHOOL_NAME} in {stu_obj['class_level']} ({stu_obj['program']}), is hereby awarded this Certificate of Completion "
-                    f"with all rights, honours, and privileges appertaining thereto."
+                    f"This is to officially certify that the above-named learner was duly enrolled at {SCHOOL_NAME}, "
+                    f"and has satisfactorily completed the prescribed course of study for {stu_obj['class_level']} "
+                    f"({stu_obj['program']}) in accordance with the academic requirements and regulations of the school. "
+                    f"This certificate is hereby issued as an official record of the learner's academic completion."
                 )
                 citation_txt = st.text_area("Certificate Citation", value=default_citation, height=95)
-                mgr_signatory = st.text_input("School Manager Signatory Name", value=user["full_name"])
+                mgr_signatory = st.text_input("Headteacher / Authorized School Official", value=user["full_name"])
 
             cert_no = f"GIS-CERT-{re.sub(r'[^A-Za-z0-9_-]+', '-', str(stu_obj['student_id']))}-{datetime.now().strftime('%Y%m%d')}"
             issue_dt = datetime.now().strftime("%d %B %Y")
