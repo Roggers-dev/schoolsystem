@@ -103,7 +103,7 @@ ALL_MENU_OPTIONS = [
 # privileged user accounts. Other roles receive only position-related modules.
 ROLE_BASE_PERMISSIONS = {
     "Admin": list(ALL_MENU_OPTIONS),
-    "Manager": [item for item in ALL_MENU_OPTIONS if item != MENU_STAFF_ROLES],
+    "Manager": [item for item in ALL_MENU_OPTIONS if item not in (MENU_STAFF_ROLES, MENU_ISSUE_MANAGEMENT, MENU_ISSUE_REPORT)],
     "Bursar": [MENU_DASHBOARD, MENU_FINANCE, MENU_EXPORT],
     "ICT Teacher": [MENU_DASHBOARD, MENU_LESSONS, MENU_ASSESSMENT, MENU_REPORTS, MENU_CERTIFICATES, MENU_ISSUE_REPORT],
     "Teacher": [MENU_DASHBOARD, MENU_LESSONS, MENU_ASSESSMENT, MENU_REPORTS, MENU_CERTIFICATES, MENU_ISSUE_REPORT],
@@ -127,15 +127,34 @@ def get_user_extra_permissions(conn, username: str):
     return [row["module_name"] for row in rows]
 
 
+TEACHER_WORKSPACE_MODULES = {
+    MENU_DASHBOARD, MENU_TIMETABLE, MENU_LESSONS, MENU_ASSESSMENT,
+    MENU_REPORTS, MENU_CERTIFICATES, MENU_ISSUE_REPORT,
+}
+
+
 def get_effective_permissions(conn, username: str, role: str):
+    """Return role permissions while enforcing non-delegable teacher data boundaries."""
     base = list(ROLE_BASE_PERMISSIONS.get(role, []))
     if role == "Admin":
-        return base
-    # Admin may grant any operational module individually, but cannot grant
-    # the account/role administration module or the Admin identity itself.
-    allowed_extras = set(ALL_MENU_OPTIONS) - {MENU_STAFF_ROLES}
+        # Admin has platform oversight; issue reporting is for staff, not Admin.
+        return [item for item in base if item != MENU_ISSUE_REPORT]
     stored_extras = set(get_user_extra_permissions(conn, username))
+    if role in ("Teacher", "ICT Teacher"):
+        # Extra privileges must never turn an individual teacher into a school-wide viewer.
+        allowed = TEACHER_WORKSPACE_MODULES
+        return [item for item in dict.fromkeys(base + list(stored_extras)) if item in allowed]
+    # Admin may grant operational modules to non-teaching staff, but not Admin controls.
+    allowed_extras = set(ALL_MENU_OPTIONS) - {MENU_STAFF_ROLES, MENU_ISSUE_REPORT, MENU_ISSUE_MANAGEMENT}
     return list(dict.fromkeys(base + [item for item in stored_extras if item in allowed_extras]))
+
+
+def get_teacher_profile(conn, username: str):
+    """Resolve the signed-in teacher profile; never infer identity from display name."""
+    return conn.execute(
+        "SELECT staff_id, full_name, assigned_subject FROM teachers WHERE username = ? LIMIT 1",
+        (username,),
+    ).fetchone()
 
 
 def write_audit_log(conn, username: str, role: str, action: str, details: str = ""):
@@ -1655,6 +1674,9 @@ menu = st.sidebar.radio("System Modules", nav_options)
 if menu not in nav_options:
     st.error("You do not have permission to open this module.")
     st.stop()
+if user["role"] in ("Teacher", "ICT Teacher") and menu not in TEACHER_WORKSPACE_MODULES:
+    st.error("This module is outside your teacher workspace. You can only access your assigned classes and your own teaching activities.")
+    st.stop()
 _focus_next_field_js()
 
 
@@ -1662,34 +1684,45 @@ _focus_next_field_js()
 # MODULE 1: DASHBOARD, GENDER TOTALS & INTERACTIVE FILTERS
 # ---------------------------------------------------------
 if menu == "📊 Dashboard, Gender Totals & Filters":
-    st.header("School Population, Gender Breakdown & Filtered Directory")
+    _is_teaching_user = user["role"] in ("Teacher", "ICT Teacher")
+    st.header("My Teaching Workspace" if _is_teaching_user else "School Population, Gender Breakdown & Filtered Directory")
+    if _is_teaching_user:
+        st.caption("This workspace shows your assigned classes and your own recorded teaching activities only.")
     conn = get_connection()
-    df_students = pd.read_sql_query(
-        "SELECT student_id, full_name, gender, class_level, program, boarding_status, guardian_name, guardian_phone, status, date_registered FROM students",
-        conn,
-    )
-    df_teachers = pd.read_sql_query(
-        "SELECT staff_id, full_name, gender, phone, email, academic_programme, department, assigned_subject, status, employment_date FROM teachers",
-        conn,
-    )
-    df_fees = pd.read_sql_query("SELECT * FROM fee_payments", conn)
-    df_occasions = pd.read_sql_query("SELECT * FROM special_occasions ORDER BY created_at DESC LIMIT 5", conn)
-    df_incidents = pd.read_sql_query("SELECT * FROM incident_reports ORDER BY created_at DESC LIMIT 5", conn)
     if user["role"] in ("Teacher", "ICT Teacher"):
-        _allowed_classes = set(get_teacher_assigned_classes(conn, user["username"]))
-        df_students = df_students[df_students["class_level"].isin(_allowed_classes)].drop(
-            columns=["guardian_name", "guardian_phone"], errors="ignore"
+        _allowed_classes = get_teacher_assigned_classes(conn, user["username"])
+        _dashboard_classes = list(_allowed_classes)
+        if _allowed_classes:
+            _class_marks = ",".join("?" for _ in _allowed_classes)
+            df_students = pd.read_sql_query(
+                f"SELECT student_id, full_name, gender, class_level, program, boarding_status, status, date_registered FROM students WHERE class_level IN ({_class_marks})",
+                conn, params=tuple(_allowed_classes),
+            )
+        else:
+            df_students = pd.DataFrame(columns=["student_id", "full_name", "gender", "class_level", "program", "boarding_status", "status", "date_registered"])
+        # Do not query school-wide staff, finance, occasion, or incident records for teachers.
+        df_teachers = pd.DataFrame(columns=["staff_id", "full_name", "gender", "phone", "email", "academic_programme", "department", "assigned_subject", "status", "employment_date"])
+        df_fees = pd.DataFrame(columns=["amount_paid"])
+        df_occasions = pd.DataFrame()
+        df_incidents = pd.DataFrame()
+    else:
+        _dashboard_classes = list(CLASS_LEVELS)
+        df_students = pd.read_sql_query(
+            "SELECT student_id, full_name, gender, class_level, program, boarding_status, guardian_name, guardian_phone, status, date_registered FROM students",
+            conn,
         )
-        df_teachers = df_teachers.iloc[0:0]
-        df_fees = df_fees.iloc[0:0]
-        df_occasions = df_occasions.iloc[0:0]
-        df_incidents = df_incidents.iloc[0:0]
-    elif user["role"] == "Bursar":
+        df_teachers = pd.read_sql_query(
+            "SELECT staff_id, full_name, gender, phone, email, academic_programme, department, assigned_subject, status, employment_date FROM teachers",
+            conn,
+        )
+        df_fees = pd.read_sql_query("SELECT * FROM fee_payments", conn)
+        df_occasions = pd.read_sql_query("SELECT * FROM special_occasions ORDER BY created_at DESC LIMIT 5", conn)
+        df_incidents = pd.read_sql_query("SELECT * FROM incident_reports ORDER BY created_at DESC LIMIT 5", conn)
+    if user["role"] == "Bursar":
         df_teachers = df_teachers.iloc[0:0]
         df_occasions = df_occasions.iloc[0:0]
         df_incidents = df_incidents.iloc[0:0]
         df_students = df_students[["student_id", "full_name", "gender", "class_level", "program", "status"]]
-    conn.close()
 
     # Exact Gender Totals across Learners, Teachers, and Combined School Population
     active_stu = df_students[df_students["status"] == "Active"] if not df_students.empty else df_students
@@ -1705,30 +1738,36 @@ if menu == "📊 Dashboard, Gender Totals & Filters":
     all_female = female_students + female_teachers
     total_collected = df_fees["amount_paid"].sum() if not df_fees.empty else 0.0
 
-    st.subheader("📌 School-Wide Gender & Population Summary")
-    r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
-    r1_c1.metric("Total Male Teachers", male_teachers)
-    r1_c2.metric("Total Female Teachers", female_teachers)
-    r1_c3.metric("All Male (Learners + Teachers)", all_male)
-    r1_c4.metric("All Female (Learners + Teachers)", all_female)
-
-    r2_c1, r2_c2, r2_c3, r2_c4 = st.columns(4)
-    r2_c1.metric("Male Learners", male_students)
-    r2_c2.metric("Female Learners", female_students)
-    r2_c3.metric("Total Active Learners", len(active_stu))
-    r2_c4.metric("Total Fees Collected", f"GHS {total_collected:,.2f}")
+    if _is_teaching_user:
+        st.subheader("📌 My Assigned-Class Summary")
+        r2_c1, r2_c2, r2_c3 = st.columns(3)
+        r2_c1.metric("Male Learners in My Classes", male_students)
+        r2_c2.metric("Female Learners in My Classes", female_students)
+        r2_c3.metric("Active Learners in My Classes", len(active_stu))
+    else:
+        st.subheader("📌 School-Wide Gender & Population Summary")
+        r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
+        r1_c1.metric("Total Male Teachers", male_teachers)
+        r1_c2.metric("Total Female Teachers", female_teachers)
+        r1_c3.metric("All Male (Learners + Teachers)", all_male)
+        r1_c4.metric("All Female (Learners + Teachers)", all_female)
+        r2_c1, r2_c2, r2_c3, r2_c4 = st.columns(4)
+        r2_c1.metric("Male Learners", male_students)
+        r2_c2.metric("Female Learners", female_students)
+        r2_c3.metric("Total Active Learners", len(active_stu))
+        r2_c4.metric("Total Fees Collected", f"GHS {total_collected:,.2f}")
 
     st.divider()
 
     # Interactive Filters Section (including Gender Filters)
-    st.subheader("🔍 Filter Directory (By Role, Gender, Class / Grade Level & Programme)")
+    st.subheader("🔍 Filter My Assigned Learners" if _is_teaching_user else "🔍 Filter Directory (By Role, Gender, Class / Grade Level & Programme)")
     f_col1, f_col2, f_col3, f_col4 = st.columns(4)
     with f_col1:
-        record_scope = st.selectbox("Directory Group", ["Learners", "Teachers", "Combined Population"])
+        record_scope = st.selectbox("Directory Group", ["Learners"] if _is_teaching_user else ["Learners", "Teachers", "Combined Population"])
     with f_col2:
         gender_filter = st.selectbox("Filter by Gender", ["All Genders", "Male", "Female"])
     with f_col3:
-        class_filter = st.selectbox("Filter by Class / Grade", ["All Classes"] + CLASS_LEVELS)
+        class_filter = st.selectbox("Filter by Class / Grade", ["All Classes"] + _dashboard_classes)
     with f_col4:
         search_text = st.text_input("Search by Name or ID", placeholder="Type name or ID...")
 
@@ -1798,29 +1837,55 @@ if menu == "📊 Dashboard, Gender Totals & Filters":
             st.subheader("Learners by Class / Grade Level")
             st.bar_chart(active_stu["class_level"].value_counts())
         with col_b:
-            st.subheader("School Gender Distribution (All Male vs All Female)")
-            gender_chart_df = pd.DataFrame(
-                {"Count": [male_students, female_students, male_teachers, female_teachers]},
-                index=["Male Learners", "Female Learners", "Male Teachers", "Female Teachers"],
-            )
+            st.subheader("Assigned-Class Gender Distribution" if _is_teaching_user else "School Gender Distribution (All Male vs All Female)")
+            if _is_teaching_user:
+                gender_chart_df = pd.DataFrame(
+                    {"Count": [male_students, female_students]},
+                    index=["Male Learners", "Female Learners"],
+                )
+            else:
+                gender_chart_df = pd.DataFrame(
+                    {"Count": [male_students, female_students, male_teachers, female_teachers]},
+                    index=["Male Learners", "Female Learners", "Male Teachers", "Female Teachers"],
+                )
             st.bar_chart(gender_chart_df)
 
     st.divider()
-    h1, h2 = st.columns(2)
-    with h1:
-        st.subheader("🎉 Recent Special Activities & Occasions")
-        if df_occasions.empty:
-            st.caption("No special occasions recorded yet.")
-        else:
-            for _, occ in df_occasions.iterrows():
-                st.info(f"**{occ['title']}** ({occ['occasion_type']} • {occ['event_date']})\n\n{occ['summary']}")
-    with h2:
-        st.subheader("⚠️ Recent Incident Reports")
-        if df_incidents.empty:
-            st.caption("No incidents reported.")
-        else:
-            for _, inc in df_incidents.iterrows():
-                st.warning(f"**{inc['class_level']} — {inc['involved_person']}** [{inc['severity']}] ({inc['incident_date']})\n\n{inc['description']}")
+    if _is_teaching_user:
+        st.subheader("🗂️ My Recent Work & Activities")
+        _my_lessons = pd.read_sql_query(
+            "SELECT log_date AS 'Date', class_level AS 'Class', subject AS 'Subject', period_type AS 'Type', areas_taught AS 'Topics Covered' FROM lesson_coverage_logs WHERE teacher_username = ? ORDER BY log_id DESC LIMIT 15",
+            conn, params=(user["username"],),
+        )
+        _my_audit = pd.read_sql_query(
+            "SELECT created_at AS 'Date / Time', action AS 'Activity', details AS 'Details' FROM system_audit_log WHERE username = ? ORDER BY audit_id DESC LIMIT 15",
+            conn, params=(user["username"],),
+        )
+        if _my_lessons.empty and _my_audit.empty:
+            st.info("You have not recorded any activities yet.")
+        if not _my_lessons.empty:
+            st.markdown("**My lesson coverage records**")
+            st.dataframe(_my_lessons, use_container_width=True, hide_index=True)
+        if not _my_audit.empty:
+            st.markdown("**My account activity**")
+            st.dataframe(_my_audit, use_container_width=True, hide_index=True)
+    else:
+        h1, h2 = st.columns(2)
+        with h1:
+            st.subheader("🎉 Recent Special Activities & Occasions")
+            if df_occasions.empty:
+                st.caption("No special occasions recorded yet.")
+            else:
+                for _, occ in df_occasions.iterrows():
+                    st.info(f"**{occ['title']}** ({occ['occasion_type']} • {occ['event_date']})\n\n{occ['summary']}")
+        with h2:
+            st.subheader("⚠️ Recent Incident Reports")
+            if df_incidents.empty:
+                st.caption("No incidents reported.")
+            else:
+                for _, inc in df_incidents.iterrows():
+                    st.warning(f"**{inc['class_level']} — {inc['involved_person']}** [{inc['severity']}] ({inc['incident_date']})\n\n{inc['description']}")
+    conn.close()
 
 
 # ---------------------------------------------------------
@@ -2805,10 +2870,21 @@ elif menu == "🧮 Continuous Assessment & Score Entry":
     st.caption("Select a class to load every active learner and every subject scheduled for that class. Enter scores directly or download, complete and upload the class CSV template.")
 
     conn = get_connection()
-    students = pd.read_sql_query(
-        "SELECT student_id, full_name, class_level, program FROM students WHERE status = 'Active' ORDER BY class_level, full_name",
-        conn,
-    )
+    if user["role"] in ("Teacher", "ICT Teacher"):
+        _assessment_classes = get_teacher_assigned_classes(conn, user["username"])
+        if _assessment_classes:
+            _marks = ",".join("?" for _ in _assessment_classes)
+            students = pd.read_sql_query(
+                f"SELECT student_id, full_name, class_level, program FROM students WHERE status='Active' AND class_level IN ({_marks}) ORDER BY class_level, full_name",
+                conn, params=tuple(_assessment_classes),
+            )
+        else:
+            students = pd.DataFrame(columns=["student_id", "full_name", "class_level", "program"])
+    else:
+        students = pd.read_sql_query(
+            "SELECT student_id, full_name, class_level, program FROM students WHERE status = 'Active' ORDER BY class_level, full_name",
+            conn,
+        )
     if students.empty:
         st.warning("Please register learners first.")
     else:
@@ -2843,8 +2919,10 @@ elif menu == "🧮 Continuous Assessment & Score Entry":
         st.caption("The class timetable determines the class subject list. This version does not yet store separate elective-subject combinations for individual learners.")
 
         existing_df = pd.read_sql_query(
-            "SELECT student_id, term, subject, class_test_1, class_test_2, project_work, exam_raw FROM assessments WHERE term = ?",
-            conn, params=(term,)
+            """SELECT a.student_id, a.term, a.subject, a.class_test_1, a.class_test_2, a.project_work, a.exam_raw
+               FROM assessments a JOIN students s ON s.student_id = a.student_id
+               WHERE a.term = ? AND s.class_level = ?""",
+            conn, params=(term, selected_cls)
         )
         existing_map = {(r["student_id"], r["subject"]): dict(r) for _, r in existing_df.iterrows()}
 
@@ -3041,10 +3119,18 @@ elif menu == "🎓 Student Certificates & Term Honours":
 
     conn = get_connection()
     c = conn.cursor()
-    students_rows = c.execute("SELECT * FROM students ORDER BY full_name ASC").fetchall()
     if user["role"] in ("Teacher", "ICT Teacher"):
-        permitted_classes = set(get_teacher_assigned_classes(conn, user["username"]))
-        students_rows = [row for row in students_rows if row["class_level"] in permitted_classes]
+        _certificate_classes = get_teacher_assigned_classes(conn, user["username"])
+        if _certificate_classes:
+            _cert_marks = ",".join("?" for _ in _certificate_classes)
+            students_rows = c.execute(
+                f"SELECT * FROM students WHERE class_level IN ({_cert_marks}) ORDER BY full_name ASC",
+                tuple(_certificate_classes),
+            ).fetchall()
+        else:
+            students_rows = []
+    else:
+        students_rows = c.execute("SELECT * FROM students ORDER BY full_name ASC").fetchall()
 
     tab_comp, tab_term, tab_bulk = st.tabs([
         "🏅 Certificate of Completion (Individual Learner)",
@@ -3794,6 +3880,9 @@ elif menu == "📩 Report Issues to School Manager":
 # MODULE 10B: SCHOOL MANAGER REPLIES TO TEACHER ISSUES
 # ---------------------------------------------------------
 elif menu == "📬 Teacher Issues & Manager Replies":
+    if user["role"] != "Admin":
+        st.error("Only the Admin can access the platform-wide staff issue inbox and audit oversight.")
+        st.stop()
     st.header("Teacher Issues Inbox & School Manager Replies")
     conn = get_connection()
     c = conn.cursor()
@@ -3842,10 +3931,18 @@ elif menu == "📬 Teacher Issues & Manager Replies":
 elif menu == "📄 Terminal Report Cards (PDF Export)":
     st.header("Automated Terminal Report Card & PDF Generator")
     conn = get_connection()
-    students = pd.read_sql_query("SELECT * FROM students WHERE status='Active' ORDER BY full_name ASC", conn)
     if user["role"] in ("Teacher", "ICT Teacher"):
-        permitted_classes = set(get_teacher_assigned_classes(conn, user["username"]))
-        students = students[students["class_level"].isin(permitted_classes)].copy()
+        _report_classes = get_teacher_assigned_classes(conn, user["username"])
+        if _report_classes:
+            _report_marks = ",".join("?" for _ in _report_classes)
+            students = pd.read_sql_query(
+                f"SELECT * FROM students WHERE status='Active' AND class_level IN ({_report_marks}) ORDER BY full_name ASC",
+                conn, params=tuple(_report_classes),
+            )
+        else:
+            students = pd.DataFrame()
+    else:
+        students = pd.read_sql_query("SELECT * FROM students WHERE status='Active' ORDER BY full_name ASC", conn)
     if students.empty:
         st.warning("No active learners found.")
     else:
@@ -3937,7 +4034,8 @@ elif menu == "📄 Terminal Report Cards (PDF Export)":
             st.caption("Each student's report card (including their passport photo) is placed on its own separate page.")
             bc1, bc2 = st.columns(2)
             with bc1:
-                batch_class = st.selectbox("Select Class / Grade Level", CLASS_LEVELS, key="batch_rep_class")
+                _report_class_options = get_teacher_assigned_classes(conn, user["username"]) if user["role"] in ("Teacher", "ICT Teacher") else CLASS_LEVELS
+                batch_class = st.selectbox("Select Class / Grade Level", _report_class_options, key="batch_rep_class")
             with bc2:
                 batch_term = st.selectbox("Select Term", ["2026/2027 - Term 1", "2026/2027 - Term 2", "2026/2027 - Term 3"], key="batch_rep_term")
 
@@ -4048,7 +4146,7 @@ elif menu == "👥 Manage Staff & Roles":
         current_role = selected_account["role"] if selected_account["role"] in ASSIGNABLE_ROLES else "Teacher"
         new_r = st.selectbox("Assign Position / Role", ASSIGNABLE_ROLES, index=ASSIGNABLE_ROLES.index(current_role), key=f"role_choice_{selected_account['username']}")
         current_extras = get_user_extra_permissions(conn, selected_account["username"])
-        extra_choices = [item for item in ALL_MENU_OPTIONS if item != MENU_STAFF_ROLES and item not in ROLE_BASE_PERMISSIONS.get(new_r, [])]
+        extra_choices = [item for item in ALL_MENU_OPTIONS if item not in (MENU_STAFF_ROLES, MENU_ISSUE_MANAGEMENT, MENU_ISSUE_REPORT) and item not in ROLE_BASE_PERMISSIONS.get(new_r, [])]
         default_extras = current_extras if new_r == current_role else []
         selected_extras = st.multiselect(
             "Extra Privileges (optional)",
