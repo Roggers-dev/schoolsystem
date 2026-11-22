@@ -105,11 +105,14 @@ ROLE_BASE_PERMISSIONS = {
     "Admin": list(ALL_MENU_OPTIONS),
     "Manager": [item for item in ALL_MENU_OPTIONS if item not in (MENU_STAFF_ROLES, MENU_ISSUE_MANAGEMENT, MENU_ISSUE_REPORT)],
     "Bursar": [MENU_DASHBOARD, MENU_FINANCE, MENU_EXPORT],
-    "ICT Teacher": [MENU_DASHBOARD, MENU_LESSONS, MENU_ASSESSMENT, MENU_REPORTS, MENU_CERTIFICATES, MENU_ISSUE_REPORT],
-    "Teacher": [MENU_DASHBOARD, MENU_LESSONS, MENU_ASSESSMENT, MENU_REPORTS, MENU_CERTIFICATES, MENU_ISSUE_REPORT],
+    # Certificate generation and issuance are Admin-only by default.
+    # Admin may delegate this module explicitly through Extra Privileges.
+    "ICT Teacher": [MENU_DASHBOARD, MENU_LESSONS, MENU_ASSESSMENT, MENU_REPORTS, MENU_ISSUE_REPORT],
+    "Teacher": [MENU_DASHBOARD, MENU_LESSONS, MENU_ASSESSMENT, MENU_REPORTS, MENU_ISSUE_REPORT],
 }
 
-# Admin-selected extras are deliberately restricted to work-related modules.
+# Admin-selected extras are explicitly delegated modules. Certificate management
+# is not included in any non-Admin base role and is available only when Admin grants it.
 # The Admin role and account-management module can never be granted here.
 ROLE_EXTRA_PRIVILEGES = {
     "Manager": [],
@@ -357,6 +360,22 @@ def capitalize_name_widget(key: str):
     """Title-case a name input when the user leaves the field or presses Enter."""
     value = st.session_state.get(key, "")
     st.session_state[key] = capitalize_initials(str(value))
+
+
+def generate_staff_id(conn, surname: str, first_name: str, middle_name: str = "") -> str:
+    """Create a readable suggested staff ID; the Admin may override it manually."""
+    initials = (re.sub(r"[^A-Za-z]", "", surname or "T")[:2] + re.sub(r"[^A-Za-z]", "", first_name or "X")[:1] + re.sub(r"[^A-Za-z]", "", middle_name or "")[:1]).upper()
+    initials = initials.ljust(3, "X")
+    year = datetime.now().strftime("%Y")
+    prefix = f"GIS-{initials}-{year}-"
+    rows = conn.execute("SELECT staff_id FROM teachers WHERE staff_id LIKE ?", (prefix + "%",)).fetchall()
+    used = set()
+    for row in rows:
+        match = re.search(r"-(\d+)$", str(row["staff_id"]))
+        if match: used.add(int(match.group(1)))
+    number = 1
+    while number in used: number += 1
+    return f"{prefix}{number:03d}"
 
 
 def save_teacher_class_assignments(conn, staff_id: str, class_levels: list):
@@ -734,6 +753,19 @@ def init_db():
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_teacher_class_staff ON teacher_class_assignments(staff_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_teacher_class_level ON teacher_class_assignments(class_level)")
+
+    # Normalized many-to-many teacher/subject assignments; keep assigned_subject as legacy primary subject.
+    c.execute("""CREATE TABLE IF NOT EXISTS teacher_subject_assignments (
+        assignment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        staff_id TEXT NOT NULL, subject TEXT NOT NULL, assigned_at TEXT NOT NULL,
+        UNIQUE(staff_id, subject),
+        FOREIGN KEY(staff_id) REFERENCES teachers(staff_id) ON DELETE CASCADE
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_teacher_subject_staff ON teacher_subject_assignments(staff_id)")
+    for _teacher in c.execute("SELECT staff_id, assigned_subject FROM teachers").fetchall():
+        _subjects = [x.strip() for x in str(_teacher["assigned_subject"] or "").split(",") if x.strip() in SUBJECTS_LIST]
+        for _subject in _subjects:
+            c.execute("INSERT OR IGNORE INTO teacher_subject_assignments (staff_id, subject, assigned_at) VALUES (?, ?, ?)", (_teacher["staff_id"], _subject, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
 
     c.execute("UPDATE students SET promotion_status = 'Promoted' WHERE promotion_status IS NULL OR TRIM(promotion_status) = ''")
     c.execute("UPDATE students SET student_edit_locked = 1 WHERE student_edit_locked IS NULL")
@@ -1583,58 +1615,6 @@ if st.session_state.user is None:
                     conn.close()
                     st.error("Invalid username or password.")
 
-        with st.expander("ℹ️ Sign-In Guidance"):
-            st.markdown(
-                "Sign in with your assigned staff, teacher, school manager, or bursar credentials."
-            )
-
-        with st.expander("🛟 Admin password recovery"):
-            st.warning(
-                "For security, recovery requires the private recovery key configured by the system owner. "
-                "The key must never be stored in this source file or shared with staff."
-            )
-            with st.form("admin_password_recovery_form"):
-                recovery_username = st.text_input("Administrator username", key="admin_recovery_username")
-                recovery_key = st.text_input("Administrator recovery key", type="password", key="admin_recovery_key")
-                recovery_new_password = st.text_input("New administrator password (10+ characters)", type="password", key="admin_recovery_new_password")
-                recovery_confirm_password = st.text_input("Confirm new password", type="password", key="admin_recovery_confirm_password")
-                recover_admin_clicked = st.form_submit_button("Recover Admin Account", use_container_width=True)
-            if recover_admin_clicked:
-                configured_key = get_admin_recovery_key()
-                if not configured_key:
-                    st.error("Admin recovery is not configured. The system owner must set GLOBE_ADMIN_RECOVERY_KEY in the hosting environment or Streamlit secrets.")
-                elif not hmac.compare_digest(recovery_key, configured_key):
-                    st.error("The recovery key is incorrect.")
-                elif len(recovery_new_password) < 10:
-                    st.error("Choose a password with at least 10 characters.")
-                elif recovery_new_password != recovery_confirm_password:
-                    st.error("The new password entries do not match.")
-                else:
-                    recovery_conn = get_connection()
-                    try:
-                        admin_row = recovery_conn.execute(
-                            "SELECT username, role FROM users WHERE username = ? COLLATE NOCASE LIMIT 1",
-                            (recovery_username.strip(),),
-                        ).fetchone()
-                        if not admin_row or str(admin_row["role"]).strip().lower() != "admin":
-                            st.error("The supplied username is not an administrator account.")
-                        else:
-                            recovery_conn.execute(
-                                "UPDATE users SET password_hash = ? WHERE username = ?",
-                                (hash_password(recovery_new_password), admin_row["username"]),
-                            )
-                            write_audit_log(
-                                recovery_conn, admin_row["username"], "Admin",
-                                "Admin password recovered",
-                                "Administrator password reset using deployment recovery key",
-                            )
-                            recovery_conn.commit()
-                            st.success("Administrator password reset successfully. You can now sign in with the new password.")
-                    except Exception:
-                        recovery_conn.rollback()
-                        st.error("Admin password recovery failed. Please check the database and try again.")
-                    finally:
-                        recovery_conn.close()
     st.stop()
 
 # Logged-in account is refreshed on every rerun so role changes take effect immediately.
@@ -2233,6 +2213,9 @@ elif menu == "📝 Student Registration & Edit":
                 with f3:
                     ed_boarding = st.selectbox("Residential Status", ["Day", "Boarding"], index=0 if rec["boarding_status"] == "Day" else 1, disabled=not is_edit_permitted)
 
+                _student_programmes = ["General Basic / Primary", "General Science", "General Arts", "Business", "Visual Arts", "Home Economics", "Agricultural Science"]
+                ed_program = st.selectbox("Academic / Class Programme", _student_programmes, index=_student_programmes.index(rec["program"]) if rec["program"] in _student_programmes else 0, disabled=not is_edit_permitted)
+
                 g1, g2, g3 = st.columns(3)
                 with g1:
                     ed_gname = st.text_input("Guardian Name", value=rec["guardian_name"] or "", disabled=not is_edit_permitted)
@@ -2261,18 +2244,19 @@ elif menu == "📝 Student Registration & Edit":
                                 """
                                 UPDATE students
                                 SET surname=?, first_name=?, middle_name=?, full_name=?,
-                                    gender=?, class_level=?, boarding_status=?,
+                                    gender=?, class_level=?, program=?, boarding_status=?,
                                     guardian_name=?, guardian_phone=?, status=?,
                                     passport_photo=?, passport_mime=?
                                 WHERE student_id=?
                                 """,
                                 (
-                                    ed_surname.strip(),
-                                    ed_first.strip(),
-                                    ed_middle.strip(),
+                                    capitalize_initials(ed_surname),
+                                    capitalize_initials(ed_first),
+                                    capitalize_initials(ed_middle),
                                     new_full,
                                     ed_gender,
                                     ed_class,
+                                    ed_program,
                                     ed_boarding,
                                     ed_gname.strip(),
                                     ed_gphone.strip(),
@@ -2561,9 +2545,10 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
         with n3:
             t_middle = st.text_input("Teacher Middle Name (Optional)", placeholder="e.g., Kwaku")
 
+        _suggested_staff_id = generate_staff_id(conn, t_surname, t_first, t_middle)
         c1, c2 = st.columns(2)
         with c1:
-            staff_id = st.text_input("Teacher Staff ID *", placeholder="e.g., GIS-TCH-001")
+            staff_id = st.text_input("Teacher Staff ID (optional manual override)", placeholder=f"Leave blank to use {_suggested_staff_id}", key="teacher_registration_staff_id", help="Leave blank to automatically generate a unique ID from the teacher's name, or enter your preferred ID.")
             t_gender = st.selectbox("Gender *", ["Male", "Female"])
             t_phone = st.text_input("Phone Number *", placeholder="e.g., 024XXXXXXX")
             t_email = st.text_input("Email Address", placeholder="e.g., teacher@globalintl.edu.gh")
@@ -2575,6 +2560,7 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
                 ["Basic & Primary", "Religious & Moral / Social", "Mathematics & ICT", "Sciences", "Languages", "Business & Arts"],
             )
             assigned_sub = st.selectbox("Primary Subject Taught *", SUBJECTS_LIST)
+            assigned_subjects = st.multiselect("Other Subjects Taught (select all that apply)", SUBJECTS_LIST, default=[assigned_sub], key="teacher_register_subjects")
             create_login = st.checkbox("Create Teacher Portal Login Account", value=True)
             t_user = st.text_input("Portal Username", placeholder="e.g., eosei")
             t_pass = st.text_input("Portal Password", type="password", placeholder="Set password")
@@ -2601,9 +2587,6 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
             elif not t_first.strip():
                 st.error("Teacher First Name is required. Cursor moved back to Teacher First Name.")
                 focus_required_input("Teacher First Name")
-            elif not staff_id.strip():
-                st.error("Teacher Staff ID is required. Cursor moved back to Teacher Staff ID.")
-                focus_required_input("Teacher Staff ID")
             elif not confirm_t:
                 st.error("Please tick the confirmation box before submitting.")
             elif create_login and (not t_user.strip() or not t_pass.strip()):
@@ -2612,10 +2595,13 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
                 st.error("Portal username must contain at least 3 characters.")
             elif create_login and len(t_pass) < 10:
                 st.error("For account security, use a portal password with at least 10 characters.")
+            elif not assigned_subjects:
+                st.error("Select at least one subject taught.")
             elif not assign_all_classes and not assigned_cls_levels:
                 st.error("Select at least one class, or tick 'Teacher handles ALL classes'.")
             else:
                 full_t_name = format_full_name(t_surname, t_first, t_middle)
+                staff_id_value = (staff_id.strip().upper() or generate_staff_id(conn, t_surname, t_first, t_middle))
                 t_photo_bytes = t_photo.getvalue() if t_photo is not None else None
                 t_photo_mime = t_photo.type if t_photo is not None else None
                 try:
@@ -2629,7 +2615,7 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')
                         """,
                         (
-                            staff_id.strip().upper(),
+                            staff_id_value,
                             capitalize_initials(t_surname),
                             capitalize_initials(t_first),
                             capitalize_initials(t_middle),
@@ -2649,16 +2635,18 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
                     )
                     save_teacher_class_assignments(
                         conn,
-                        staff_id.strip().upper(),
+                        staff_id_value,
                         CLASS_LEVELS if assign_all_classes else assigned_cls_levels,
                     )
+                    c.execute("DELETE FROM teacher_subject_assignments WHERE staff_id=?", (staff_id_value,))
+                    c.executemany("INSERT INTO teacher_subject_assignments (staff_id, subject, assigned_at) VALUES (?, ?, ?)", [(staff_id_value, _sub, datetime.now().strftime("%Y-%m-%d %H:%M:%S")) for _sub in dict.fromkeys([assigned_sub] + assigned_subjects)])
                     if create_login:
                         c.execute(
                             "INSERT INTO users (username, password_hash, full_name, role, assigned_subject, passport_photo, passport_mime) VALUES (?, ?, ?, 'Teacher', ?, ?, ?)",
                             (t_user.strip(), hash_password(t_pass), full_t_name, assigned_sub, t_photo_bytes, t_photo_mime),
                         )
                     conn.commit()
-                    st.success(f"Teacher **{full_t_name}** (`{staff_id.upper()}`) registered under **{acad_prog}**!")
+                    st.success(f"Teacher **{full_t_name}** (`{staff_id_value}`) registered under **{acad_prog}**!")
                 except sqlite3.IntegrityError:
                     conn.rollback()
                     st.error("Staff ID or Username already exists. No partial teacher record was saved.")
@@ -2741,7 +2729,63 @@ elif menu == "👨‍🏫 Teacher Registration & Directory":
                 ).fetchall()
                 class_names = [row["class_level"] for row in class_rows]
                 class_text = "All Classes" if len(class_names) == len(CLASS_LEVELS) else (", ".join(class_names) if class_names else "Not assigned")
-                st.markdown(f"**{tr['full_name']}** (`{tr['staff_id']}`) — **{tr['gender']}** | **{tr['academic_programme']}** | Subject: **{tr['assigned_subject']}** | Classes: **{class_text}** | Dept: {tr['department']} | Tel: {tr['phone']}")
+                _subject_rows = c.execute("SELECT subject FROM teacher_subject_assignments WHERE staff_id=? ORDER BY assignment_id", (tr["staff_id"],)).fetchall()
+                _subject_text = ", ".join(r["subject"] for r in _subject_rows) or tr["assigned_subject"]
+                st.markdown(f"**{tr['full_name']}** (`{tr['staff_id']}`) — **{tr['gender']}** | **{tr['academic_programme']}** | Subjects: **{_subject_text}** | Classes: **{class_text}** | Dept: {tr['department']} | Tel: {tr['phone']}")
+
+    if user.get("role") == "Admin":
+        st.divider()
+        st.subheader("Edit Teacher Registration")
+        _edit_teacher_rows = c.execute("SELECT staff_id, full_name FROM teachers ORDER BY full_name").fetchall()
+        if _edit_teacher_rows:
+            _teacher_options = {f"{r['full_name']} ({r['staff_id']})": r["staff_id"] for r in _edit_teacher_rows}
+            _chosen_teacher_label = st.selectbox("Select teacher to edit", list(_teacher_options), key="admin_edit_teacher_select")
+            _chosen_sid = _teacher_options[_chosen_teacher_label]
+            _er = c.execute("SELECT * FROM teachers WHERE staff_id=?", (_chosen_sid,)).fetchone()
+            _current_subject_rows = c.execute("SELECT subject FROM teacher_subject_assignments WHERE staff_id=? ORDER BY assignment_id", (_chosen_sid,)).fetchall()
+            _current_subjects = [r["subject"] for r in _current_subject_rows] or ([_er["assigned_subject"]] if _er["assigned_subject"] in SUBJECTS_LIST else [])
+            if _er["passport_photo"]: st.image(_er["passport_photo"], caption=f"Current photo: {_er['full_name']}", width=120)
+            with st.form(f"admin_edit_teacher_form_{_chosen_sid}"):
+                _ec1, _ec2, _ec3 = st.columns(3)
+                with _ec1: _esurname = st.text_input("Surname", value=_er["surname"] or "")
+                with _ec2: _efirst = st.text_input("First Name", value=_er["first_name"] or "")
+                with _ec3: _emiddle = st.text_input("Middle Name", value=_er["middle_name"] or "")
+                _ec4, _ec5 = st.columns(2)
+                with _ec4: _egender = st.selectbox("Gender", ["Male", "Female"], index=0 if _er["gender"] == "Male" else 1)
+                with _ec5: _ephone = st.text_input("Phone", value=_er["phone"] or "")
+                _eemail = st.text_input("Email", value=_er["email"] or "")
+                _eprogramme = st.selectbox("Academic Programme", TEACHER_ACADEMIC_PROGRAMMES, index=TEACHER_ACADEMIC_PROGRAMMES.index(_er["academic_programme"]) if _er["academic_programme"] in TEACHER_ACADEMIC_PROGRAMMES else 0)
+                _edepartments = ["Basic & Primary", "Religious & Moral / Social", "Mathematics & ICT", "Sciences", "Languages", "Business & Arts"]
+                _edepartment = st.selectbox("Department", _edepartments, index=_edepartments.index(_er["department"]) if _er["department"] in _edepartments else 0)
+                _esubjects = st.multiselect("Subjects taught", SUBJECTS_LIST, default=_current_subjects)
+                _class_rows = c.execute("SELECT class_level FROM teacher_class_assignments WHERE staff_id=? ORDER BY assignment_id", (_chosen_sid,)).fetchall()
+                _existing_classes = [r["class_level"] for r in _class_rows] or get_teacher_assigned_classes(conn, _er["username"] or "")
+                _eclasses = st.multiselect("Classes taught", CLASS_LEVELS, default=_existing_classes)
+                _estatus = st.selectbox("Status", ["Active", "Inactive"], index=0 if (_er["status"] or "Active") == "Active" else 1)
+                _ephoto = st.file_uploader("Upload or replace teacher passport photo", type=["png", "jpg", "jpeg"], key=f"admin_teacher_photo_{_chosen_sid}")
+                _save_teacher_edit = st.form_submit_button("Save Teacher Changes")
+            if _save_teacher_edit:
+                if not _esurname.strip() or not _efirst.strip() or not _esubjects or not _eclasses:
+                    st.error("Surname, first name, at least one subject and at least one class are required.")
+                else:
+                    try:
+                        create_db_backup("teacher_edit")
+                        _full_name = format_full_name(_esurname, _efirst, _emiddle)
+                        _photo = _ephoto.getvalue() if _ephoto is not None else _er["passport_photo"]
+                        _mime = _ephoto.type if _ephoto is not None else _er["passport_mime"]
+                        _primary_subject = _esubjects[0]
+                        c.execute("UPDATE teachers SET surname=?, first_name=?, middle_name=?, full_name=?, gender=?, phone=?, email=?, academic_programme=?, department=?, assigned_subject=?, assigned_class_level=?, passport_photo=?, passport_mime=?, status=? WHERE staff_id=?", (capitalize_initials(_esurname), capitalize_initials(_efirst), capitalize_initials(_emiddle), _full_name, _egender, _ephone.strip(), _eemail.strip(), _eprogramme, _edepartment, _primary_subject, ", ".join(_eclasses), _photo, _mime, _estatus, _chosen_sid))
+                        save_teacher_class_assignments(conn, _chosen_sid, _eclasses)
+                        c.execute("DELETE FROM teacher_subject_assignments WHERE staff_id=?", (_chosen_sid,))
+                        c.executemany("INSERT INTO teacher_subject_assignments (staff_id, subject, assigned_at) VALUES (?, ?, ?)", [(_chosen_sid, _sub, datetime.now().strftime("%Y-%m-%d %H:%M:%S")) for _sub in _esubjects])
+                        if _er["username"]:
+                            c.execute("UPDATE users SET full_name=?, assigned_subject=?, passport_photo=?, passport_mime=? WHERE username=?", (_full_name, _primary_subject, _photo, _mime, _er["username"]))
+                        conn.commit()
+                        st.success("Teacher record, subjects, classes and passport photo updated.")
+                        st.rerun()
+                    except Exception as _teacher_edit_error:
+                        conn.rollback()
+                        st.error(f"Teacher update failed; no partial changes were saved: {_teacher_edit_error}")
     conn.close()
 
 
@@ -2969,7 +3013,18 @@ elif menu == "📖 Daily/Weekly Lessons & Remaining Topics":
             l_class = st.selectbox("Class / Grade Level", lesson_class_options)
         with l2:
             _teacher_subject = user.get("assigned_subject")
-            _lesson_subjects = [_teacher_subject] if user["role"] in ("Teacher", "ICT Teacher") and _teacher_subject in SUBJECTS_LIST else SUBJECTS_LIST
+            if user["role"] in ("Teacher", "ICT Teacher"):
+                _subject_conn = get_connection()
+                _subject_row = _subject_conn.execute("SELECT staff_id FROM teachers WHERE username=?", (user["username"],)).fetchone()
+                _lesson_subjects = [r["subject"] for r in _subject_conn.execute("SELECT subject FROM teacher_subject_assignments WHERE staff_id=? ORDER BY assignment_id", (_subject_row["staff_id"],)).fetchall()] if _subject_row else []
+                _subject_conn.close()
+                if not _lesson_subjects and _teacher_subject in SUBJECTS_LIST: _lesson_subjects = [_teacher_subject]
+                if not _lesson_subjects: _lesson_subjects = [_teacher_subject] if _teacher_subject in SUBJECTS_LIST else []
+            else:
+                _lesson_subjects = SUBJECTS_LIST
+            if not _lesson_subjects:
+                st.warning("No subjects are assigned to this teacher. Ask the Admin to update the teacher's subject allocation.")
+                st.stop()
             l_subject = st.selectbox("Subject", _lesson_subjects)
         with l3:
             period_type = st.selectbox("Log Frequency", ["Daily", "Weekly"])
@@ -3068,8 +3123,12 @@ elif menu == "🧮 Continuous Assessment & Score Entry":
         )["subject"].dropna().astype(str).tolist()
         class_subjects = timetable_subjects or list(SUBJECTS_LIST)
         if user["role"] in ("Teacher", "ICT Teacher"):
-            assigned_subject = (user.get("assigned_subject") or "").strip()
-            class_subjects = [x for x in class_subjects if x == assigned_subject]
+            _ts_conn = get_connection()
+            _ts_profile = _ts_conn.execute("SELECT staff_id FROM teachers WHERE username=?", (user["username"],)).fetchone()
+            _teacher_subjects = [r["subject"] for r in _ts_conn.execute("SELECT subject FROM teacher_subject_assignments WHERE staff_id=?", (_ts_profile["staff_id"],)).fetchall()] if _ts_profile else []
+            _ts_conn.close()
+            if not _teacher_subjects and user.get("assigned_subject"): _teacher_subjects = [user.get("assigned_subject")]
+            class_subjects = [x for x in class_subjects if x in _teacher_subjects]
         if not class_subjects:
             st.warning("No subjects are available for this class and staff account. Check the class timetable and teacher subject assignment.")
             conn.close()
@@ -3689,9 +3748,11 @@ elif menu == "📥 CSV File Generator & Data Export":
             if _class_col in export_df.columns:
                 export_df = export_df[export_df[_class_col].isin(_assigned)]
                 break
-        _assigned_subject = user.get("assigned_subject")
-        if _assigned_subject and "Subject" in export_df.columns:
-            export_df = export_df[export_df["Subject"] == _assigned_subject]
+        _ts_profile = conn.execute("SELECT staff_id FROM teachers WHERE username=?", (user["username"],)).fetchone()
+        _assigned_subjects = [r["subject"] for r in conn.execute("SELECT subject FROM teacher_subject_assignments WHERE staff_id=?", (_ts_profile["staff_id"],)).fetchall()] if _ts_profile else []
+        if not _assigned_subjects and user.get("assigned_subject"): _assigned_subjects = [user.get("assigned_subject")]
+        if _assigned_subjects and "Subject" in export_df.columns:
+            export_df = export_df[export_df["Subject"].isin(_assigned_subjects)]
 
     conn.close()
 
