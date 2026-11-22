@@ -11,6 +11,7 @@ import os
 import tempfile
 import unicodedata
 import math
+import zipfile
 from fpdf import FPDF
 
 # ---------------------------------------------------------
@@ -130,7 +131,9 @@ def get_effective_permissions(conn, username: str, role: str):
     base = list(ROLE_BASE_PERMISSIONS.get(role, []))
     if role == "Admin":
         return base
-    allowed_extras = set(ROLE_EXTRA_PRIVILEGES.get(role, []))
+    # Admin may grant any operational module individually, but cannot grant
+    # the account/role administration module or the Admin identity itself.
+    allowed_extras = set(ALL_MENU_OPTIONS) - {MENU_STAFF_ROLES}
     stored_extras = set(get_user_extra_permissions(conn, username))
     return list(dict.fromkeys(base + [item for item in stored_extras if item in allowed_extras]))
 
@@ -537,6 +540,20 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+
+    # In-app notifications for issue reports and manager replies.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS app_notifications (
+            notification_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient_username TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT NOT NULL,
+            related_issue_id INTEGER,
+            is_read INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_app_notifications_user ON app_notifications(recipient_username, is_read, notification_id)")
 
     # School Attendance Register Table
     c.execute("""
@@ -1486,6 +1503,24 @@ _auth_conn.close()
 if user.get("passport_photo"):
     st.sidebar.image(user["passport_photo"], caption=f"{user['full_name']} ({user['role']})", width=120)
 st.sidebar.success(f"👤 **{user['full_name']}**\n\nRole: `{user['role']}`")
+try:
+    _notice_conn = get_connection()
+    _notices = _notice_conn.execute(
+        "SELECT notification_id, title, message, created_at FROM app_notifications WHERE recipient_username=? AND is_read=0 ORDER BY notification_id DESC LIMIT 20",
+        (user["username"],),
+    ).fetchall()
+    if _notices:
+        with st.sidebar.expander(f"🔔 Notifications ({len(_notices)})", expanded=True):
+            for _notice in _notices:
+                st.warning(f"**{_notice['title']}**\n\n{_notice['message']}\n\n{_notice['created_at']}")
+                if st.button("Mark as read", key=f"read_notice_{_notice['notification_id']}"):
+                    _notice_conn.execute("UPDATE app_notifications SET is_read=1 WHERE notification_id=? AND recipient_username=?", (_notice["notification_id"], user["username"]))
+                    _notice_conn.commit()
+                    st.rerun()
+    _notice_conn.close()
+except Exception:
+    try: _notice_conn.close()
+    except Exception: pass
 if st.sidebar.button("Logout"):
     st.session_state.user = None
     st.rerun()
@@ -2059,6 +2094,36 @@ elif menu == "📝 Student Registration & Edit":
                     st.success(f"**{p_rec['full_name']}** (`{p_rec['student_id']}`) set to **{new_promo_status}** in **{target_promo_class}**.")
                     st.rerun()
 
+    st.divider()
+    st.subheader("👥 Bulk Student Promotion / Placement")
+    if students_rows:
+        bulk_classes = sorted({r["class_level"] for r in students_rows if r["class_level"]})
+        bulk_source = st.selectbox("Select current class", bulk_classes, key="bulk_promo_source")
+        bulk_candidates = [dict(r) for r in students_rows if r["class_level"] == bulk_source]
+        bulk_map = {f"{r['student_id']} — {r['full_name']}": r["student_id"] for r in bulk_candidates}
+        bulk_selected_labels = st.multiselect("Select any number of learners to promote together", list(bulk_map.keys()), key="bulk_promo_students")
+        with st.form("bulk_promotion_form"):
+            bp1, bp2 = st.columns(2)
+            with bp1:
+                bulk_target_class = st.selectbox("New class / grade", CLASS_LEVELS, index=min(CLASS_LEVELS.index(bulk_source)+1, len(CLASS_LEVELS)-1) if bulk_source in CLASS_LEVELS else 0)
+            with bp2:
+                bulk_status = st.selectbox("New progression status", promo_choices, index=0)
+            bulk_reason = st.text_input("Promotion note (optional)")
+            bulk_confirm = st.checkbox("Confirm updating all selected learners")
+            if st.form_submit_button("Promote Selected Learners"):
+                if not bulk_selected_labels:
+                    st.error("Select at least one learner.")
+                elif not bulk_confirm:
+                    st.error("Confirm the bulk promotion before saving.")
+                else:
+                    ids = [bulk_map[x] for x in bulk_selected_labels]
+                    create_db_backup("bulk_student_promotion")
+                    c.executemany("UPDATE students SET class_level=?, promotion_status=? WHERE student_id=?", [(bulk_target_class, bulk_status, sid) for sid in ids])
+                    write_audit_log(conn, user["username"], user["role"], "Bulk student progression", f"{len(ids)} learners: {bulk_source} -> {bulk_target_class}; {bulk_status}; {bulk_reason}")
+                    conn.commit()
+                    st.success(f"Updated {len(ids)} learner(s) to {bulk_target_class}.")
+                    st.rerun()
+
     if user["role"] == "Admin":
         st.divider()
         st.subheader("🛡️ Admin Privilege: Remove Student History (With Reason)")
@@ -2121,6 +2186,62 @@ elif menu == "📝 Student Registration & Edit":
         if not rem_logs_df.empty:
             st.caption("Audit Log of Removed Student History")
             st.dataframe(rem_logs_df, use_container_width=True)
+
+        st.divider()
+        st.subheader("🚨 Admin: Remove a Student or Teacher Record")
+        st.warning("Permanent deletion. A database backup and mandatory reason are required. This removes the selected person's profile and associated records.")
+        delete_kind = st.radio("Record type", ["Student", "Teacher"], horizontal=True, key="admin_delete_kind")
+        delete_reason = st.text_area("Reason for permanent deletion *", key="admin_delete_reason")
+        if delete_kind == "Student":
+            delete_rows = c.execute("SELECT student_id, full_name, class_level FROM students ORDER BY full_name").fetchall()
+            delete_options = {f"{r['student_id']} — {r['full_name']} ({r['class_level']})": dict(r) for r in delete_rows}
+        else:
+            delete_rows = c.execute("SELECT staff_id, full_name, username FROM teachers ORDER BY full_name").fetchall()
+            delete_options = {f"{r['staff_id']} — {r['full_name']}": dict(r) for r in delete_rows}
+        if delete_options:
+            delete_label = st.selectbox("Select record to remove", list(delete_options.keys()), key="admin_delete_target")
+            delete_confirm = st.checkbox("I understand this is permanent and have verified the selected record.", key="admin_delete_confirm")
+            if st.button("Permanently Remove Selected Record", type="primary", key="admin_delete_submit"):
+                if not delete_reason.strip() or not delete_confirm:
+                    st.error("A reason and confirmation are both required.")
+                else:
+                    try:
+                        create_db_backup("admin_person_record_deletion")
+                        conn.execute("BEGIN IMMEDIATE")
+                        target = delete_options[delete_label]
+                        if delete_kind == "Student":
+                            target_id = target["student_id"]
+                            # Delete every related table that explicitly stores this student_id.
+                            for table_row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+                                table_name = table_row[0]
+                                if table_name == "students":
+                                    continue
+                                columns = [x[1] for x in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()]
+                                if "student_id" in columns:
+                                    conn.execute(f'DELETE FROM "{table_name}" WHERE student_id=?', (target_id,))
+                            conn.execute("DELETE FROM students WHERE student_id=?", (target_id,))
+                            details = f"Student {target_id} / {target['full_name']}; reason: {delete_reason.strip()}"
+                        else:
+                            target_id = target["staff_id"]
+                            linked_username = target.get("username")
+                            conn.execute("DELETE FROM teacher_class_assignments WHERE staff_id=?", (target_id,))
+                            conn.execute("DELETE FROM lesson_coverage_logs WHERE teacher_username=?", (linked_username or "",))
+                            conn.execute("DELETE FROM school_timetable WHERE teacher_name=?", (target["full_name"],))
+                            conn.execute("DELETE FROM teachers WHERE staff_id=?", (target_id,))
+                            if linked_username:
+                                conn.execute("DELETE FROM app_notifications WHERE recipient_username=?", (linked_username,))
+                                conn.execute("DELETE FROM user_extra_permissions WHERE username=?", (linked_username,))
+                                conn.execute("DELETE FROM users WHERE username=? AND role!='Admin'", (linked_username,))
+                            details = f"Teacher {target_id} / {target['full_name']}; linked account={linked_username or 'none'}; reason: {delete_reason.strip()}"
+                        write_audit_log(conn, user["username"], user["role"], f"Admin deleted {delete_kind.lower()} record", details)
+                        conn.commit()
+                        st.success(f"The selected {delete_kind.lower()} record and associated data were removed. The action was recorded in the audit log.")
+                        st.rerun()
+                    except Exception as delete_error:
+                        conn.rollback()
+                        st.error(f"Deletion failed and was rolled back: {delete_error}")
+        else:
+            st.info(f"No {delete_kind.lower()} records are available to remove.")
 
     conn.close()
 
@@ -2854,9 +2975,10 @@ elif menu == "🎓 Student Certificates & Term Honours":
         permitted_classes = set(get_teacher_assigned_classes(conn, user["username"]))
         students_rows = [row for row in students_rows if row["class_level"] in permitted_classes]
 
-    tab_comp, tab_term = st.tabs([
+    tab_comp, tab_term, tab_bulk = st.tabs([
         "🏅 Certificate of Completion (Individual Learner)",
         "🌟 End-of-Term Overall Qualification Certificates",
+        "📦 Bulk Certificate Downloads",
     ])
 
     with tab_comp:
@@ -3040,8 +3162,62 @@ elif menu == "🎓 Student Certificates & Term Honours":
                         file_name=f"{re.sub(r'[^A-Za-z0-9_-]+', '_', str(q_stu['student_id']))}_{re.sub(r'[^A-Za-z0-9_-]+', '_', eval_term)}_Term_Certificate.pdf",
                         mime="application/pdf",
                     )
+                if st.button("Prepare Certificates for ALL Qualified Learners", key="prepare_all_term_certificates"):
+                    term_zip_buffer = io.BytesIO()
+                    with zipfile.ZipFile(term_zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                        for qualified in qualified_list:
+                            safe_qid = re.sub(r"[^A-Za-z0-9_-]+", "_", str(qualified["student_id"]))
+                            q_cert_no = f"GIS-TERM-{safe_qid}-{term_code}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                            q_citation = (f"having demonstrated commendable academic excellence and discipline during {eval_term} in "
+                                          f"{qualified['class_level']}, achieving an overall average of {qualified['overall_avg']}% across "
+                                          f"{qualified['subjects_taken']} subject(s), has duly qualified for the Overall Term Award of {qualified['honour_tier']}.")
+                            q_pdf = generate_student_certificate_pdf(qualified, q_cert_no, f"OVERALL TERM CERTIFICATE OF EXCELLENCE ({eval_term})", qualified["honour_tier"], q_citation, term_issue_dt, user["full_name"])
+                            zf.writestr(f"{safe_qid}_{term_code}_Term_Certificate.pdf", q_pdf)
+                    st.session_state["all_term_certificates_zip"] = term_zip_buffer.getvalue()
+                    st.session_state["all_term_certificates_zip_name"] = f"{term_code}_All_Qualified_Certificates.zip"
+                    write_audit_log(conn, user["username"], user["role"], "Bulk end-of-term certificates generated", f"{eval_term}: {len(qualified_list)} learners")
+                    conn.commit()
+                    st.success(f"Prepared {len(qualified_list)} end-of-term certificate(s). Download the ZIP below.")
+                if st.session_state.get("all_term_certificates_zip"):
+                    st.download_button("📥 Download All Qualified Term Certificates (ZIP)", data=st.session_state["all_term_certificates_zip"], file_name=st.session_state.get("all_term_certificates_zip_name", "Term_Certificates.zip"), mime="application/zip")
             else:
                 st.warning(f"No pupils met the qualifying average of {qual_threshold}% for {eval_term}.")
+
+    with tab_bulk:
+        st.subheader("Download Multiple Completion Certificates")
+        st.caption("Select a class and any number of learners. Each certificate is generated as a separate PDF inside one ZIP download.")
+        bulk_cert_class = st.selectbox("Certificate class", sorted({r["class_level"] for r in students_rows}), key="bulk_cert_class") if students_rows else None
+        if bulk_cert_class:
+            bulk_cert_students = [dict(r) for r in students_rows if r["class_level"] == bulk_cert_class]
+            cert_student_map = {f"{r['student_id']} — {r['full_name']}": r for r in bulk_cert_students}
+            cert_selected = st.multiselect("Select learners for certificates", list(cert_student_map.keys()), key="bulk_cert_students")
+            bulk_cert_heading = st.text_input("Certificate heading", value="CERTIFICATE OF COMPLETION", key="bulk_cert_heading")
+            bulk_cert_subtitle = st.text_input("Certificate subtitle", value=f"Awarded upon successful completion of {bulk_cert_class}", key="bulk_cert_subtitle")
+            bulk_cert_signatory = st.text_input("Signatory", value=user["full_name"], key="bulk_cert_signatory")
+            bulk_cert_confirm = st.checkbox("I confirm these certificates are for the selected learners", key="bulk_cert_confirm")
+            if st.button("Prepare Bulk Certificate ZIP", type="primary", key="prepare_bulk_cert_zip"):
+                if not cert_selected:
+                    st.error("Select at least one learner.")
+                elif not bulk_cert_confirm:
+                    st.error("Confirm the certificate selection first.")
+                else:
+                    zip_buffer = io.BytesIO()
+                    issued = datetime.now().strftime("%d %B %Y")
+                    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                        for label in cert_selected:
+                            student_obj = cert_student_map[label]
+                            safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(student_obj["student_id"]))
+                            cert_no = f"GIS-CERT-{safe_id}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                            citation = f"having fulfilled the academic, moral, and practical requirements prescribed by {SCHOOL_NAME} in {student_obj['class_level']} ({student_obj['program']}), is hereby awarded this Certificate of Completion."
+                            cert_bytes = generate_student_certificate_pdf(student_obj, cert_no, bulk_cert_heading, bulk_cert_subtitle, citation, issued, bulk_cert_signatory)
+                            zf.writestr(f"{safe_id}_Completion_Certificate.pdf", cert_bytes)
+                    st.session_state["bulk_certificate_zip"] = zip_buffer.getvalue()
+                    st.session_state["bulk_certificate_zip_name"] = f"{re.sub(r'[^A-Za-z0-9_]+', '_', bulk_cert_class)}_Certificates_{datetime.now().strftime('%Y%m%d')}.zip"
+                    write_audit_log(conn, user["username"], user["role"], "Bulk certificates generated", f"{bulk_cert_class}: {len(cert_selected)} learners")
+                    conn.commit()
+                    st.success(f"Prepared {len(cert_selected)} certificate PDF(s). Download the ZIP below.")
+            if st.session_state.get("bulk_certificate_zip"):
+                st.download_button("📥 Download All Selected Certificates (ZIP)", data=st.session_state["bulk_certificate_zip"], file_name=st.session_state.get("bulk_certificate_zip_name", "Certificates.zip"), mime="application/zip")
 
     conn.close()
 
@@ -3511,8 +3687,16 @@ elif menu == "📩 Report Issues to School Manager":
                     """,
                     (user["username"], user["full_name"], is_cat, is_subj.strip(), is_body.strip(), datetime.now().strftime("%Y-%m-%d %H:%M")),
                 )
+                issue_id = c.lastrowid
+                recipients = c.execute("SELECT username FROM users WHERE role IN ('Admin','Manager')").fetchall()
+                notice_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                for recipient in recipients:
+                    c.execute(
+                        "INSERT INTO app_notifications (recipient_username, title, message, related_issue_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (recipient["username"], "New staff issue reported", f"{user['full_name']} reported: {is_subj.strip()}", issue_id, notice_time),
+                    )
                 conn.commit()
-                st.success("Your issue has been sent to the School Manager!")
+                st.success("Your issue has been sent. The Admin and School Manager will receive an in-app notification.")
 
     st.divider()
     st.subheader("My Reported Issues & School Manager Replies")
@@ -3570,8 +3754,12 @@ elif menu == "📬 Teacher Issues & Manager Replies":
                         """,
                         (reply_text.strip(), new_status, user["full_name"], datetime.now().strftime("%Y-%m-%d %H:%M"), target_issue["issue_id"]),
                     )
+                    conn.execute(
+                        "INSERT INTO app_notifications (recipient_username, title, message, related_issue_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (target_issue["teacher_username"], "School response to your issue", f"Your issue '{target_issue['subject_line']}' has been updated: {new_status}.", target_issue["issue_id"], datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    )
                     conn.commit()
-                    st.success(f"Reply sent to **{target_issue['teacher_name']}**!")
+                    st.success(f"Reply sent to **{target_issue['teacher_name']}** and an in-app notification was delivered.")
 
     conn.close()
 
@@ -3682,6 +3870,26 @@ elif menu == "📄 Terminal Report Cards (PDF Export)":
                 batch_term = st.selectbox("Select Term", ["2026/2027 - Term 1", "2026/2027 - Term 2", "2026/2027 - Term 3"], key="batch_rep_term")
 
             class_students = students[students["class_level"] == batch_class]
+            if not class_students.empty:
+                batch_student_map = {f"{r['student_id']} — {r['full_name']}": r["student_id"] for _, r in class_students.iterrows()}
+                selected_batch_labels = st.multiselect("Choose learners for batch report cards (leave blank to include the whole class)", list(batch_student_map.keys()), key="batch_report_students")
+                if selected_batch_labels:
+                    selected_batch_ids = {batch_student_map[x] for x in selected_batch_labels}
+                    class_students = class_students[class_students["student_id"].isin(selected_batch_ids)].copy()
+                st.subheader("Bulk Behaviour Recording")
+                bulk_behaviour = st.selectbox("Behaviour to apply to selected learners", BEHAVIOUR_OPTIONS, key="batch_behaviour_value")
+                behaviour_target_labels = st.multiselect("Select learners to receive this behaviour (leave blank to apply to the report-card selection)", list(batch_student_map.keys()), key="batch_behaviour_students")
+                if st.button("Save Behaviour for Selected Learners", key="save_batch_behaviour"):
+                    behaviour_ids = [batch_student_map[x] for x in behaviour_target_labels] if behaviour_target_labels else class_students["student_id"].astype(str).tolist()
+                    if not behaviour_ids:
+                        st.error("Select at least one learner.")
+                    else:
+                        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        for behaviour_sid in behaviour_ids:
+                            conn.execute("INSERT INTO student_behaviours (student_id, term, behaviour_label, recorded_by, recorded_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(student_id, term) DO UPDATE SET behaviour_label=excluded.behaviour_label, recorded_by=excluded.recorded_by, recorded_at=excluded.recorded_at", (behaviour_sid, batch_term, bulk_behaviour, user["full_name"], stamp))
+                        conn.commit()
+                        st.success(f"Saved '{bulk_behaviour}' for {len(behaviour_ids)} learner(s).")
+                        st.rerun()
             if class_students.empty:
                 st.info(f"No active learners registered in **{batch_class}**.")
             else:
@@ -3768,16 +3976,16 @@ elif menu == "👥 Manage Staff & Roles":
         current_role = selected_account["role"] if selected_account["role"] in ASSIGNABLE_ROLES else "Teacher"
         new_r = st.selectbox("Assign Position / Role", ASSIGNABLE_ROLES, index=ASSIGNABLE_ROLES.index(current_role), key=f"role_choice_{selected_account['username']}")
         current_extras = get_user_extra_permissions(conn, selected_account["username"])
-        extra_choices = ROLE_EXTRA_PRIVILEGES.get(new_r, [])
+        extra_choices = [item for item in ALL_MENU_OPTIONS if item != MENU_STAFF_ROLES and item not in ROLE_BASE_PERMISSIONS.get(new_r, [])]
         default_extras = current_extras if new_r == current_role else []
         selected_extras = st.multiselect(
             "Extra Privileges (optional)",
             options=extra_choices,
             default=[x for x in default_extras if x in extra_choices],
             key=f"extra_privileges_{selected_account['username']}_{new_r}",
-            help="Only position-related extra modules are shown. Admin access and account management cannot be granted here.",
+            help="Admin can grant any additional operational module. Admin identity and role/account administration cannot be delegated.",
         )
-        st.info("Base permissions are automatically included for the selected role. Extra privileges add only the selected modules.")
+        st.info("Base permissions are automatically included. You may grant any additional operational module to this staff account. Admin identity and role administration remain protected.")
         with st.expander(f"View base modules included with the {new_r} role"):
             for base_module in ROLE_BASE_PERMISSIONS.get(new_r, []):
                 st.write(f"• {base_module}")
@@ -3804,7 +4012,7 @@ elif menu == "👥 Manage Staff & Roles":
                     conn.execute("UPDATE users SET role = ? WHERE username = ? AND role != 'Admin'", (new_r, selected_account["username"]))
                     conn.execute("DELETE FROM user_extra_permissions WHERE username = ?", (selected_account["username"],))
                     now_value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    valid_extras = [x for x in selected_extras if x in ROLE_EXTRA_PRIVILEGES.get(new_r, [])]
+                    valid_extras = [x for x in selected_extras if x in ALL_MENU_OPTIONS and x != MENU_STAFF_ROLES and x not in ROLE_BASE_PERMISSIONS.get(new_r, [])]
                     conn.executemany(
                         "INSERT INTO user_extra_permissions (username, module_name, granted_by, granted_at) VALUES (?, ?, ?, ?)",
                         [(selected_account["username"], item, user["username"], now_value) for item in valid_extras],
