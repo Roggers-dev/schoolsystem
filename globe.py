@@ -299,6 +299,21 @@ def hash_password(password: str) -> str:
     return f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}"
 
 
+def get_admin_recovery_key() -> str:
+    """Read the administrator recovery secret from deployment configuration only.
+
+    Never store this recovery secret in the application database or source file.
+    Configure GLOBE_ADMIN_RECOVERY_KEY in the host environment or Streamlit secrets.
+    """
+    configured = os.environ.get("GLOBE_ADMIN_RECOVERY_KEY", "").strip()
+    if configured:
+        return configured
+    try:
+        return str(st.secrets.get("GLOBE_ADMIN_RECOVERY_KEY", "")).strip()
+    except Exception:
+        return ""
+
+
 def verify_password(password: str, stored_hash: str) -> bool:
     """Verify modern hashes and transparently accept legacy SHA-256 hashes."""
     if not stored_hash:
@@ -1572,6 +1587,54 @@ if st.session_state.user is None:
             st.markdown(
                 "Sign in with your assigned staff, teacher, school manager, or bursar credentials."
             )
+
+        with st.expander("🛟 Admin password recovery"):
+            st.warning(
+                "For security, recovery requires the private recovery key configured by the system owner. "
+                "The key must never be stored in this source file or shared with staff."
+            )
+            with st.form("admin_password_recovery_form"):
+                recovery_username = st.text_input("Administrator username", key="admin_recovery_username")
+                recovery_key = st.text_input("Administrator recovery key", type="password", key="admin_recovery_key")
+                recovery_new_password = st.text_input("New administrator password (10+ characters)", type="password", key="admin_recovery_new_password")
+                recovery_confirm_password = st.text_input("Confirm new password", type="password", key="admin_recovery_confirm_password")
+                recover_admin_clicked = st.form_submit_button("Recover Admin Account", use_container_width=True)
+            if recover_admin_clicked:
+                configured_key = get_admin_recovery_key()
+                if not configured_key:
+                    st.error("Admin recovery is not configured. The system owner must set GLOBE_ADMIN_RECOVERY_KEY in the hosting environment or Streamlit secrets.")
+                elif not hmac.compare_digest(recovery_key, configured_key):
+                    st.error("The recovery key is incorrect.")
+                elif len(recovery_new_password) < 10:
+                    st.error("Choose a password with at least 10 characters.")
+                elif recovery_new_password != recovery_confirm_password:
+                    st.error("The new password entries do not match.")
+                else:
+                    recovery_conn = get_connection()
+                    try:
+                        admin_row = recovery_conn.execute(
+                            "SELECT username, role FROM users WHERE username = ? COLLATE NOCASE LIMIT 1",
+                            (recovery_username.strip(),),
+                        ).fetchone()
+                        if not admin_row or str(admin_row["role"]).strip().lower() != "admin":
+                            st.error("The supplied username is not an administrator account.")
+                        else:
+                            recovery_conn.execute(
+                                "UPDATE users SET password_hash = ? WHERE username = ?",
+                                (hash_password(recovery_new_password), admin_row["username"]),
+                            )
+                            write_audit_log(
+                                recovery_conn, admin_row["username"], "Admin",
+                                "Admin password recovered",
+                                "Administrator password reset using deployment recovery key",
+                            )
+                            recovery_conn.commit()
+                            st.success("Administrator password reset successfully. You can now sign in with the new password.")
+                    except Exception:
+                        recovery_conn.rollback()
+                        st.error("Admin password recovery failed. Please check the database and try again.")
+                    finally:
+                        recovery_conn.close()
     st.stop()
 
 # Logged-in account is refreshed on every rerun so role changes take effect immediately.
@@ -1615,57 +1678,154 @@ if st.sidebar.button("Logout"):
     st.session_state.user = None
     st.rerun()
 
-with st.sidebar.expander("🔐 Change My Password"):
-    # Widgets inside a form must use the active container (st.*), not
-    # st.sidebar.* again. Re-entering the sidebar context while a form is
-    # active triggers StreamlitInvalidLayoutContextError.
-    with st.form(f"change_password_form_{user['username']}"):
-        current_password = st.text_input(
-            "Current Password", type="password",
-            key=f"current_password_{user['username']}"
-        )
-        new_password = st.text_input(
-            "New Password (10+ characters)", type="password",
-            key=f"new_password_{user['username']}"
-        )
-        confirm_new_password = st.text_input(
-            "Confirm New Password", type="password",
-            key=f"confirm_password_{user['username']}"
-        )
-        change_password_clicked = st.form_submit_button("Update My Password")
+if user.get("role") == "Admin":
+    with st.sidebar.expander("⚙️ Admin: Account Settings", expanded=False):
+        st.caption("Change your Admin username, password, or both. Your existing Admin account, permissions, and school records will be retained.")
+        with st.form("admin_account_settings_form"):
+            admin_current_password = st.text_input("Current Admin Password", type="password", key="admin_settings_current_password")
+            admin_new_username = st.text_input("New Admin Username", value=user["username"], key="admin_settings_new_username")
+            admin_new_password = st.text_input("New Password (leave blank to keep current password)", type="password", key="admin_settings_new_password")
+            admin_confirm_password = st.text_input("Confirm New Password", type="password", key="admin_settings_confirm_password")
+            admin_update_clicked = st.form_submit_button("Save Admin Login Changes", use_container_width=True)
 
-    if change_password_clicked:
-        password_conn = get_connection()
+        if admin_update_clicked:
+            old_username = user["username"]
+            requested_username = admin_new_username.strip()
+            admin_conn = get_connection()
+            try:
+                current_row = admin_conn.execute(
+                    "SELECT username, password_hash, full_name, role, assigned_subject, passport_photo, passport_mime FROM users WHERE username = ?",
+                    (old_username,),
+                ).fetchone()
+                if not current_row or str(current_row["role"]).strip().lower() != "admin":
+                    st.sidebar.error("The current Admin account could not be verified.")
+                elif not verify_password(admin_current_password, current_row["password_hash"]):
+                    st.sidebar.error("Your current password is incorrect. No changes were made.")
+                elif not requested_username or len(requested_username) < 3 or not re.fullmatch(r"[A-Za-z0-9_.-]+", requested_username):
+                    st.sidebar.error("Username must be at least 3 characters and contain only letters, numbers, dots, underscores, or hyphens.")
+                elif admin_new_password and len(admin_new_password) < 10:
+                    st.sidebar.error("New password must contain at least 10 characters.")
+                elif admin_new_password and admin_new_password != admin_confirm_password:
+                    st.sidebar.error("The new password and confirmation do not match.")
+                elif admin_new_password and verify_password(admin_new_password, current_row["password_hash"]):
+                    st.sidebar.error("Choose a password different from your current password.")
+                else:
+                    target_match = admin_conn.execute(
+                        "SELECT username FROM users WHERE username = ? COLLATE NOCASE AND username != ? LIMIT 1",
+                        (requested_username, old_username),
+                    ).fetchone()
+                    if target_match:
+                        st.sidebar.error("That username is already in use. Choose another one.")
+                    else:
+                        new_hash = hash_password(admin_new_password) if admin_new_password else current_row["password_hash"]
+                        admin_conn.execute("BEGIN IMMEDIATE")
+                        if requested_username != old_username:
+                            # Insert the same Admin account under its new login first, then migrate
+                            # account-linked rows before deleting the old username. Academic and
+                            # school records are not keyed to this login and remain untouched.
+                            admin_conn.execute(
+                                "INSERT INTO users (username, password_hash, full_name, role, assigned_subject, passport_photo, passport_mime) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                (requested_username, new_hash, current_row["full_name"], current_row["role"], current_row["assigned_subject"], current_row["passport_photo"], current_row["passport_mime"] if "passport_mime" in current_row.keys() else None),
+                            )
+                            admin_conn.execute("UPDATE user_extra_permissions SET username=? WHERE username=?", (requested_username, old_username))
+                            admin_conn.execute("UPDATE teachers SET username=? WHERE username=?", (requested_username, old_username))
+                            admin_conn.execute("UPDATE app_notifications SET recipient_username=? WHERE recipient_username=?", (requested_username, old_username))
+                            admin_conn.execute("DELETE FROM users WHERE username=? AND role='Admin'", (old_username,))
+                        else:
+                            admin_conn.execute("UPDATE users SET password_hash=? WHERE username=? AND role='Admin'", (new_hash, old_username))
+                        change_summary = []
+                        if requested_username != old_username:
+                            change_summary.append(f"username changed from {old_username} to {requested_username}")
+                        if admin_new_password:
+                            change_summary.append("password changed")
+                        write_audit_log(admin_conn, requested_username, "Admin", "Admin login details updated", "; ".join(change_summary) or "Admin settings saved")
+                        admin_conn.commit()
+                        st.session_state.user["username"] = requested_username
+                        st.sidebar.success("Admin login details updated. Your school data and Admin privileges have been preserved.")
+                        st.rerun()
+            except Exception:
+                admin_conn.rollback()
+                st.sidebar.error("Admin login details could not be updated. No partial changes were saved.")
+            finally:
+                admin_conn.close()
+else:
+    with st.sidebar.expander("🔐 Change My Password"):
+        with st.form(f"change_password_form_{user['username']}"):
+            current_password = st.text_input("Current Password", type="password", key=f"current_password_{user['username']}")
+            new_password = st.text_input("New Password (10+ characters)", type="password", key=f"new_password_{user['username']}")
+            confirm_new_password = st.text_input("Confirm New Password", type="password", key=f"confirm_password_{user['username']}")
+            change_password_clicked = st.form_submit_button("Update My Password")
+        if change_password_clicked:
+            password_conn = get_connection()
+            try:
+                stored_row = password_conn.execute("SELECT password_hash FROM users WHERE username = ?", (user["username"],)).fetchone()
+                if not stored_row or not verify_password(current_password, stored_row["password_hash"]):
+                    st.sidebar.error("The current password is incorrect.")
+                elif len(new_password) < 10:
+                    st.sidebar.error("New password must contain at least 10 characters.")
+                elif new_password != confirm_new_password:
+                    st.sidebar.error("The new password and confirmation do not match.")
+                elif verify_password(new_password, stored_row["password_hash"]):
+                    st.sidebar.error("Choose a new password different from your current password.")
+                else:
+                    password_conn.execute("UPDATE users SET password_hash = ? WHERE username = ?", (hash_password(new_password), user["username"]))
+                    write_audit_log(password_conn, user["username"], user["role"], "Password changed", "Account owner changed their password")
+                    password_conn.commit()
+                    st.sidebar.success("Your password has been updated securely.")
+            except Exception:
+                password_conn.rollback()
+                st.sidebar.error("Your password could not be updated. Please try again.")
+            finally:
+                password_conn.close()
+
+# Admin-only staff account assistance. Passwords are never viewable; only hashes are stored.
+if user.get("role") == "Admin":
+    with st.sidebar.expander("🔐 Admin: Staff account recovery", expanded=False):
+        st.caption("View staff usernames and account details, or issue a temporary password reset. Existing passwords cannot be viewed because they are securely hashed.")
+        staff_conn = get_connection()
         try:
-            stored_row = password_conn.execute(
-                "SELECT password_hash FROM users WHERE username = ?",
-                (user["username"],)
-            ).fetchone()
-            if not stored_row or not verify_password(current_password, stored_row["password_hash"]):
-                st.sidebar.error("The current password is incorrect.")
-            elif len(new_password) < 10:
-                st.sidebar.error("New password must contain at least 10 characters.")
-            elif new_password != confirm_new_password:
-                st.sidebar.error("The new password and confirmation do not match.")
-            elif new_password == current_password:
-                st.sidebar.error("Choose a new password different from your current password.")
+            staff_rows = staff_conn.execute(
+                "SELECT username, full_name, role, assigned_subject FROM users "
+                "WHERE LOWER(TRIM(role)) IN ('teacher', 'ict teacher') ORDER BY full_name COLLATE NOCASE"
+            ).fetchall()
+            if staff_rows:
+                staff_labels = {
+                    f"{row['full_name']} · {row['username']} · {row['role']}"
+                    + (f" · {row['assigned_subject']}" if row['assigned_subject'] else ""): row["username"]
+                    for row in staff_rows
+                }
+                selected_staff_label = st.selectbox(
+                    "Select teacher account", list(staff_labels.keys()), key="admin_reset_teacher_select"
+                )
+                selected_staff_username = staff_labels[selected_staff_label]
+                if st.button("Generate temporary password", key="admin_generate_teacher_temp_password", use_container_width=True):
+                    temporary_password = secrets.token_urlsafe(12)
+                    staff_conn.execute(
+                        "UPDATE users SET password_hash = ? WHERE username = ?",
+                        (hash_password(temporary_password), selected_staff_username),
+                    )
+                    write_audit_log(
+                        staff_conn, user["username"], user["role"],
+                        "Teacher password reset",
+                        f"Temporary password issued for teacher account {selected_staff_username}",
+                    )
+                    staff_conn.commit()
+                    st.session_state["_admin_temp_password_result"] = {
+                        "username": selected_staff_username, "password": temporary_password
+                    }
+                temp_result = st.session_state.get("_admin_temp_password_result")
+                if temp_result:
+                    st.success(f"Temporary password for {temp_result['username']}. Share it privately with the account owner:")
+                    st.code(temp_result["password"], language=None)
+                    if st.button("Clear displayed temporary password", key="clear_admin_temp_password"):
+                        st.session_state.pop("_admin_temp_password_result", None)
+                        st.rerun()
             else:
-                password_conn.execute(
-                    "UPDATE users SET password_hash = ? WHERE username = ?",
-                    (hash_password(new_password), user["username"]),
-                )
-                write_audit_log(
-                    password_conn, user["username"], user["role"],
-                    "Password changed", "Account owner changed their password"
-                )
-                password_conn.commit()
-                st.sidebar.success("Your password has been updated securely.")
+                st.info("No teacher accounts were found.")
         except Exception:
-            password_conn.rollback()
-            st.sidebar.error("Your password could not be updated. Please try again.")
-            raise
+            st.error("Staff account recovery information could not be loaded.")
         finally:
-            password_conn.close()
+            staff_conn.close()
 
 if not nav_options:
     st.error("No modules are assigned to this account. Please contact the system administrator.")
