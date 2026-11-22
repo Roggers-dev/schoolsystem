@@ -157,17 +157,26 @@ def pdf_safe_text(value):
 
 
 def pdf_output_bytes(pdf):
-    """Return clean PDF bytes across legacy PyFPDF and modern fpdf2 releases.
+    """Finalize an FPDF document and return validated raw PDF bytes.
 
-    Both libraries have changed the return type and output API over time.  The
-    default output() call is the most compatible path; normalize strings,
-    bytearrays and memoryviews, and remove an optional BOM before validation.
+    PyFPDF 1.x and fpdf2 2.x differ in their output() defaults and return
+    types.  The in-memory destination ("S") is the portable contract across
+    both families: PyFPDF returns a Latin-1 string and fpdf2 returns bytes.
     """
-    output = pdf.output()
+    try:
+        # Explicit in-memory output avoids browser/inline/file destinations.
+        output = pdf.output(dest="S")
+    except TypeError:
+        # Compatibility for wrappers that removed the legacy dest parameter.
+        output = pdf.output()
+
     if output is None:
-        raise RuntimeError("The PDF library returned no document data.")
+        raise RuntimeError(
+            "The PDF library returned no data. Check the installed fpdf package."
+        )
+
     if isinstance(output, str):
-        data = output.encode("latin-1", errors="replace")
+        data = output.encode("latin-1")
     elif isinstance(output, (bytes, bytearray, memoryview)):
         data = bytes(output)
     else:
@@ -178,11 +187,17 @@ def pdf_output_bytes(pdf):
                 f"Unsupported PDF output type: {type(output).__name__}"
             ) from exc
 
-    # A few wrappers prepend a UTF-8 BOM or whitespace before the PDF header.
+    # Remove only known transport prefixes; do not silently accept arbitrary data.
+    data = data.lstrip(b"\xef\xbb\xbf\x00\t\r\n ")
     header_at = data.find(b"%PDF-")
-    if 0 <= header_at <= 1024:
-        data = data[header_at:]
-    return data
+    if header_at == -1 or header_at > 32:
+        preview = data[:24].hex(" ") if data else "empty"
+        raise ValueError(
+            "FPDF did not return a PDF document (missing %PDF- header; "
+            f"output type={type(output).__name__}, prefix={preview}). "
+            "Check for conflicting PyFPDF/fpdf2 installations."
+        )
+    return data[header_at:]
 
 
 def validate_pdf_bytes(data):
